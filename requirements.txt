@@ -4,3 +4,4 @@ natsort
 pydub
 torch
 torchaudio
+nvidia-cudnn

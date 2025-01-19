@@ -6,7 +6,7 @@ docker build -t audio-transcriber .
 ```
 Run container
 ```
-docker run --name audio-transcriber -p 8565:8565 -v /myrecords_path:/mnt/myrecords/ audio-transcriber
+docker run --name audio-transcriber --gpus all -p 8565:8565 -v /myrecords_path:/mnt/myrecords/ audio-transcriber
 ```
 
 Use app
