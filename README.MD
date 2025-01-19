@@ -22,7 +22,7 @@ curl http://0.0.0.0:8565/get_transcription?audio_path=/mnt/myrecords/2025-01-19_
 
 then get transcription text
 ```
-curl http://0.0.0.0:8565/get_status?statusfile=/mnt/c/users/ilya/Videos/myrecords/2025-01-19_22-54-48.mp3.lock
+curl http://0.0.0.0:8565/get_status?statusfile=/mnt/myrecords/2025-01-19_22-54-48.mp3.lock
 ```
 
 ```
