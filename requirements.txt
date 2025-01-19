@@ -1,0 +1,6 @@
+whisperx
+flask
+natsort
+pydub
+pytorch
+torchaudio
