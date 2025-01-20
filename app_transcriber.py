@@ -10,27 +10,27 @@ from pydub.utils import make_chunks
 from os import mkdir, path, remove, environ, mknod
 import shutil
 from flask import Flask, request, Response, jsonify
-from threading import Lock
 import sys
-from natsort import natsorted
+
+# from natsort import natsorted
 
 APP_PORT = environ.get("APP_PORT")
 APP_DEBUG = environ.get("APP_DEBUG", False)
 HF_TOKEN = environ.get("HF_TOKEN")
+MEDIA_FOLDER = environ.get("MEDIA_FOLDER")
 transcripted_extender = "_transcription.txt"
+chunks_extender = "_chunks"
 
 app = Flask(__name__)
-lock = Lock()
 
 
-def create_chunks(chunk_length_ms, chunks_folder, source_filepath):
+def create_chunks(chunk_length_ms, chunks_folder, source_filename):
     # Prepare file to not overload CUDA
     chunk_names = []
-    myaudio = AudioSegment.from_file(source_filepath)
+    myaudio = AudioSegment.from_file(path.join(MEDIA_FOLDER, source_filename))
     chunks = make_chunks(myaudio, chunk_length_ms)
 
-    audio_filename = path.basename(source_filepath)
-    audio_name, ext = path.splitext(audio_filename)
+    audio_name, ext = path.splitext(source_filename)
 
     try:
         shutil.rmtree(chunks_folder)
@@ -117,13 +117,13 @@ def process_audio(audio_file, model_config, speakers_from_to: tuple):
     return result
 
 
-def transcribe(source_file, speakers_count=None):
+def transcribe(source_filename, speakers_count=None):
     # audio_name = "deepai2611"
     # audio_extention = "wav"
     # source_file = audio_name + "." + audio_extention
-    audio_namepath, ext = path.splitext(source_file)
-    chunks_folder = audio_namepath + "_chunks"
-    transcription_file = audio_namepath + transcripted_extender
+    audio_name, ext = path.splitext(source_filename)
+    chunks_folder = path.join(MEDIA_FOLDER, audio_name + chunks_extender)
+    transcription_file = path.join(MEDIA_FOLDER, audio_name + transcripted_extender)
 
     model_config = {
         "language": "ru",
@@ -135,7 +135,7 @@ def transcribe(source_file, speakers_count=None):
     chunk_names = create_chunks(
         chunk_length_ms=int(environ.get("CHUNK_LENGTH_MS", 200000)),
         chunks_folder=chunks_folder,
-        source_filepath=source_file,
+        source_filename=source_filename,
     )
     print("JOBS TODAY: ", ", ".join(chunk_names))
 
@@ -165,40 +165,67 @@ def transcribe(source_file, speakers_count=None):
                 else:
                     f.write("\r\n" + segment["text"])
 
-    remove(source_file + ".lock")
+    remove(path.join(MEDIA_FOLDER, source_filename) + ".lock")
+
+
+@app.route("/", methods=["GET"])
+def root_page():
+    return Response("OK")
 
 
 @app.route("/get_status", methods=["GET"])
 def get_status():
-    statusfile = request.values.get("statusfile", None)
-    if path.exists(statusfile):
+    status_filename = request.values.get("statusfile", None)
+    if path.exists(path.join(MEDIA_FOLDER, status_filename)):
         return jsonify({"status": "IN PROGRESS"})
     else:
-        filepath, ext = path.splitext(statusfile.replace(".lock", ""))
-        with open(filepath + transcripted_extender, "r") as f:
-            transcription_text = f.read()
-        return jsonify({"status": "OK", "transcription_text": transcription_text.strip()})
+        filename, ext = path.splitext(status_filename.replace(".lock", ""))
+        try:
+            with open(
+                path.join(MEDIA_FOLDER, filename + transcripted_extender), "r"
+            ) as f:
+                transcription_text = f.read()
+
+            # remove artifacts
+            shutil.rmtree(path.join(MEDIA_FOLDER, filename + chunks_extender))
+            remove(path.join(MEDIA_FOLDER, filename + transcripted_extender))
+
+            return jsonify(
+                {"status": "OK", "transcription_text": transcription_text.strip()}
+            )
+        except FileNotFoundError:
+            return jsonify({"status": "ERROR", "message": "Transcription not found"})
 
 
 @app.route("/get_transcription", methods=["GET"])
 def transcribe_from_mp3():
-    audio_path = request.values.get("audio_path", None)
+    audio_name = request.values.get("audio_name", None)
+
+    if not audio_name:
+        return jsonify({"status": "ERROR", "message": "No audio name provided"})
+
+    filepath = path.join(MEDIA_FOLDER, audio_name)
+    if not path.exists(filepath):
+        return jsonify(
+            {"status": "ERROR", "message": f"File {filepath} not found on host"}
+        )
+
     # speakers_count = request.values.get("speakers_count", None)
     transcribe_thread = threading.Thread(
         target=transcribe,
-        name=f"Transcriber {audio_path}",
-        args=(audio_path, None),
+        name=f"Transcriber {audio_name}",
+        args=(audio_name, None),
     )
     transcribe_thread.start()
-    statusfile = audio_path + ".lock"
-    mknod(statusfile)
+    statusfile = audio_name + ".lock"
+    mknod(path.join(MEDIA_FOLDER, statusfile))
     # transcription_text = transcribe(audio_path, speakers_count)
     return jsonify({"status": "OK", "statusfile": statusfile})
 
 
 def main():
     app.run(debug=bool(APP_DEBUG), host="::", port=APP_PORT)
- 
+
 
 if __name__ == "__main__":
     try:
