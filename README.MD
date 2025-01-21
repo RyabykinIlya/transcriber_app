@@ -1,28 +1,28 @@
 # Audio to speech transcriber
 
-Build image
+### Build image
 ```
 docker build -t audio-transcriber .
 ```
-Run container
+### Run container
 ```
 docker run --name audio-transcriber --gpus all -p 8565:8565 -v /myrecords_path:/mnt/myrecords/ audio-transcriber
 ```
 
-Use app
+### Use app
 ```
-curl http://0.0.0.0:8565/get_transcription?audio_path=/mnt/myrecords/2025-01-19_22-54-48.mp3
+curl http://0.0.0.0:8565/get_transcription?audio_path=2025-01-19_22-54-48.mp3
 ```
 ```
 {
   "status": "OK",
-  "statusfile": "/mnt/myrecords/2025-01-19_22-54-48.mp3.lock"
+  "statusfile": "2025-01-19_22-54-48.mp3.lock"
 }
 ```
 
 then get transcription text
 ```
-curl http://0.0.0.0:8565/get_status?statusfile=/mnt/myrecords/2025-01-19_22-54-48.mp3.lock
+curl http://0.0.0.0:8565/get_status?statusfile=2025-01-19_22-54-48.mp3.lock
 ```
 
 ```
@@ -31,3 +31,13 @@ curl http://0.0.0.0:8565/get_status?statusfile=/mnt/myrecords/2025-01-19_22-54-4
   "transcription_text": "<text here>"
 }
 ```
+
+### Size of image layers:
+|CMD|SIZE|
+|---|---|
+|RUN /bin/sh -c apt-get update &&    apt install -y cuda-toolkit|7.82GB|
+|RUN /bin/sh -c pip install -r requirements.txt|9.47GB|
+|RUN /bin/sh -c pip install nvidia-pyindex && pip install nvidia-cudnn |1.46GB|
+|RUN /bin/sh -c python app_transcriber.py load|5.61GB |
+
+Overall: 25Gb

@@ -11,6 +11,7 @@ from os import mkdir, path, remove, environ, mknod
 import shutil
 from flask import Flask, request, Response, jsonify
 import sys
+import logging
 
 # from natsort import natsorted
 
@@ -21,7 +22,16 @@ MEDIA_FOLDER = environ.get("MEDIA_FOLDER")
 transcripted_extender = "_transcription.txt"
 chunks_extender = "_chunks"
 
+model_config = {
+    "language": "ru",
+    "batch_size": int(environ.get("BATCH_SIZE", 16)),
+    "compute_type": environ.get("COMPUTE_TYPE", "float16"),
+    "device": "cuda",
+}
+
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
+logger.setLevel(environ.get("LOGGING_LEVEL", "INFO"))
 
 
 def create_chunks(chunk_length_ms, chunks_folder, source_filename):
@@ -43,10 +53,10 @@ def create_chunks(chunk_length_ms, chunks_folder, source_filename):
         pass
 
     audio_extention = "wav"
-    print(f"{chunks_folder=}")
+    logger.debug(f"{chunks_folder=}")
     for i, chunk in enumerate(chunks):
         chunk_name = "{0}_chunk{1}.{2}".format(audio_name, i, audio_extention)
-        print("exporting ", chunk_name)
+        logger.debug(f"exporting {chunk_name}")
         chunk.export(path.join(chunks_folder, chunk_name), format=audio_extention)
         chunk_names.append(chunk_name)
 
@@ -56,7 +66,7 @@ def create_chunks(chunk_length_ms, chunks_folder, source_filename):
     return chunk_names
 
 
-def process_audio(audio_file, model_config, speakers_from_to: tuple):
+def process_audio(audio_file, speakers_from_to: tuple):
     language_code, batch_size, compute_type, device = model_config.values()
     # 1. Transcribe with original whisper (batched)
     model = whisperx.load_model(
@@ -125,19 +135,12 @@ def transcribe(source_filename, speakers_count=None):
     chunks_folder = path.join(MEDIA_FOLDER, audio_name + chunks_extender)
     transcription_file = path.join(MEDIA_FOLDER, audio_name + transcripted_extender)
 
-    model_config = {
-        "language": "ru",
-        "batch_size": int(environ.get("BATCH_SIZE", 16)),
-        "compute_type": environ.get("COMPUTE_TYPE", "float16"),
-        "device": "cuda",
-    }
-
     chunk_names = create_chunks(
         chunk_length_ms=int(environ.get("CHUNK_LENGTH_MS", 200000)),
         chunks_folder=chunks_folder,
         source_filename=source_filename,
     )
-    print("JOBS TODAY: ", ", ".join(chunk_names))
+    logger.debug(f'JOBS TODAY: {", ".join(chunk_names)}')
 
     try:
         remove(transcription_file)
@@ -151,10 +154,8 @@ def transcribe(source_filename, speakers_count=None):
 
     for chunk_name in chunk_names:
         audio_file = path.join(chunks_folder, chunk_name)
-        print(">> processing", audio_file)
-        result = process_audio(
-            audio_file, model_config, speakers_from_to=speakers_from_to
-        )
+        logger.debug(f">> processing {audio_file}")
+        result = process_audio(audio_file, speakers_from_to=speakers_from_to)
 
         # print("diarize_segments: ", diarize_segments)
         with open(transcription_file, "a+") as f:
@@ -231,6 +232,17 @@ if __name__ == "__main__":
     try:
         # pass someth to load models
         sys.argv[1]
-        transcribe("for_load.mp3")
+        language_code, batch_size, compute_type, device = model_config.values()
+        try:
+            whisperx.load_model(
+                "large-v2", device, language=language_code, compute_type=compute_type
+            )
+        except RuntimeError:
+            pass
+
+        try:
+            whisperx.load_align_model(language_code=language_code, device=device)
+        except RuntimeError:
+            pass
     except IndexError:
         main()
