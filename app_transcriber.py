@@ -21,6 +21,7 @@ HF_TOKEN = environ.get("HF_TOKEN")
 MEDIA_FOLDER = environ.get("MEDIA_FOLDER")
 lock_extender = ".lock"
 transcripted_extender = "_transcription.txt"
+errorfile_extender = "_error.log"
 chunks_extender = "_chunks"
 
 model_config = {
@@ -68,6 +69,9 @@ def create_chunks(chunk_length_ms, chunks_folder, source_filename):
 
 
 def process_audio(audio_file, speakers_from_to: tuple):
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     language_code, batch_size, compute_type, device = model_config.values()
     # 1. Transcribe with original whisper (batched)
     model = whisperx.load_model(
@@ -114,12 +118,12 @@ def process_audio(audio_file, speakers_from_to: tuple):
         result = whisperx.assign_word_speakers(diarize_segments, result)
 
     # delete model if low on GPU resources
-    import gc
+    # import gc
 
     gc.collect()
     torch.cuda.empty_cache()
     del model
-    import gc
+    # import gc
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -156,7 +160,12 @@ def transcribe(source_filename, speakers_count=None):
     for chunk_name in chunk_names:
         audio_file = path.join(chunks_folder, chunk_name)
         logger.debug(f">> processing {audio_file}")
-        result = process_audio(audio_file, speakers_from_to=speakers_from_to)
+        try:
+            result = process_audio(audio_file, speakers_from_to=speakers_from_to)
+        except RuntimeError as e:
+            with open(audio_name + errorfile_extender, "a+") as f:
+                f.write(f"{audio_file} {e}\n")
+            logger.exception(e)
 
         # print("diarize_segments: ", diarize_segments)
         with open(transcription_file, "a+") as f:
@@ -166,6 +175,7 @@ def transcribe(source_filename, speakers_count=None):
                     f.write("\r\n" + segment["speaker"] + ": " + segment["text"])
                 else:
                     f.write("\r\n" + segment["text"])
+        logger.debug(f"result written to {transcription_file}")
 
     remove(path.join(MEDIA_FOLDER, source_filename) + lock_extender)
 
@@ -178,25 +188,35 @@ def root_page():
 @app.route("/get_status", methods=["GET"])
 def get_status():
     status_filename = request.values.get("statusfile", None)
+    filename, ext = path.splitext(status_filename.replace(lock_extender, ""))
+    if path.exists(filename + errorfile_extender):
+        with open(filename + errorfile_extender, "r") as f:
+            error_message = f.read()
+        return jsonify({"status": "ERROR", "message": f"Error in transcription process: {error_message}"})
+
     if path.exists(path.join(MEDIA_FOLDER, status_filename)):
         return jsonify({"status": "IN PROGRESS"})
     else:
-        filename, ext = path.splitext(status_filename.replace(lock_extender, ""))
         try:
-            with open(
-                path.join(MEDIA_FOLDER, filename + transcripted_extender), "r"
-            ) as f:
+            transcription_file = filename + transcripted_extender
+            with open(path.join(MEDIA_FOLDER, transcription_file), "r") as f:
                 transcription_text = f.read()
 
             # remove artifacts
             shutil.rmtree(path.join(MEDIA_FOLDER, filename + chunks_extender))
-            remove(path.join(MEDIA_FOLDER, filename + transcripted_extender))
+            remove(path.join(MEDIA_FOLDER, transcription_file))
 
             return jsonify(
                 {"status": "OK", "transcription_text": transcription_text.strip()}
             )
-        except FileNotFoundError:
-            return jsonify({"status": "ERROR", "message": "Transcription not found"})
+        except FileNotFoundError as e:
+            logger.exception(f"Transcription {path.join(MEDIA_FOLDER, transcription_file)} not found\n\n{e}")
+            return jsonify(
+                {
+                    "status": "ERROR",
+                    "message": f"Transcription {transcription_file} not found",
+                }
+            )
 
 
 @app.route("/get_transcription", methods=["GET"])
@@ -204,7 +224,7 @@ def transcribe_from_mp3():
     audio_name = request.values.get("audio_name", None)
 
     if not audio_name:
-        return jsonify({"status": "ERROR", "message": "No audio name provided"})
+        return jsonify({"status": "ERROR", "message": "No audio_name provided"})
 
     filepath = path.join(MEDIA_FOLDER, audio_name)
     if not path.exists(filepath):
@@ -220,7 +240,10 @@ def transcribe_from_mp3():
     )
     transcribe_thread.start()
     statusfile = audio_name + lock_extender
-    mknod(path.join(MEDIA_FOLDER, statusfile))
+    try:
+        mknod(path.join(MEDIA_FOLDER, statusfile))
+    except FileExistsError:
+        pass
     # transcription_text = transcribe(audio_path, speakers_count)
     return jsonify({"status": "OK", "statusfile": statusfile})
 
