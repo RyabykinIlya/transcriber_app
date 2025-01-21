@@ -19,6 +19,7 @@ APP_PORT = environ.get("APP_PORT")
 APP_DEBUG = environ.get("APP_DEBUG", False)
 HF_TOKEN = environ.get("HF_TOKEN")
 MEDIA_FOLDER = environ.get("MEDIA_FOLDER")
+lock_extender = ".lock"
 transcripted_extender = "_transcription.txt"
 chunks_extender = "_chunks"
 
@@ -166,7 +167,7 @@ def transcribe(source_filename, speakers_count=None):
                 else:
                     f.write("\r\n" + segment["text"])
 
-    remove(path.join(MEDIA_FOLDER, source_filename) + ".lock")
+    remove(path.join(MEDIA_FOLDER, source_filename) + lock_extender)
 
 
 @app.route("/", methods=["GET"])
@@ -180,7 +181,7 @@ def get_status():
     if path.exists(path.join(MEDIA_FOLDER, status_filename)):
         return jsonify({"status": "IN PROGRESS"})
     else:
-        filename, ext = path.splitext(status_filename.replace(".lock", ""))
+        filename, ext = path.splitext(status_filename.replace(lock_extender, ""))
         try:
             with open(
                 path.join(MEDIA_FOLDER, filename + transcripted_extender), "r"
@@ -218,7 +219,7 @@ def transcribe_from_mp3():
         args=(audio_name, None),
     )
     transcribe_thread.start()
-    statusfile = audio_name + ".lock"
+    statusfile = audio_name + lock_extender
     mknod(path.join(MEDIA_FOLDER, statusfile))
     # transcription_text = transcribe(audio_path, speakers_count)
     return jsonify({"status": "OK", "statusfile": statusfile})

@@ -11,8 +11,6 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_6
     dpkg -i cuda-keyring_1.1-1_all.deb
 RUN apt-get update &&\
     apt install -y cuda-toolkit
-RUN export PATH=/usr/local/cuda-12.6/bin${PATH:+:${PATH}} && \
-    export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib:/usr/local/lib/python3.10/site-packages/nvidia/cudnn/lib
 
 ENV APP_PORT=3000
 ENV APP_DEBUG=
@@ -23,6 +21,9 @@ RUN pip install -r requirements.txt
 RUN pip install nvidia-pyindex && \
     pip install nvidia-cudnn
 RUN rm -rf /root/.cache/pip 
+
+ENV PATH="/usr/local/cuda-12.6/bin${PATH:+:${PATH}}"
+ENV LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib:/usr/local/lib/python3.10/site-packages/nvidia/cudnn/lib"
 
 COPY for_load.mp3 .
 COPY app_transcriber.py .

@@ -6,12 +6,13 @@ docker build -t audio-transcriber .
 ```
 ### Run container
 ```
-docker run --name audio-transcriber --gpus all -p 8565:8565 -v /myrecords_path:/mnt/myrecords/ audio-transcriber
+docker run -d --name audio-transcriber --env-file /home/user/transcriber_app/.env --gpus all -p 8565:8565 -v /mnt/meeting_r
+ecords/audio:/records audio-transcriber
 ```
 
 ### Use app
 ```
-curl http://0.0.0.0:8565/get_transcription?audio_path=2025-01-19_22-54-48.mp3
+curl http://0.0.0.0:8565/get_transcription?audio_name=2025-01-19_22-54-48.mp3
 ```
 ```
 {
