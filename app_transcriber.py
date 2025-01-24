@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 @dataclass
 class ModelConfig:
     language: str
+    model_name: str
     batch_size: int
     compute_type: str
     device: str = "cuda" 
@@ -32,10 +33,10 @@ class TranscriberApp:
         self.logger.setLevel(environ.get("LOGGING_LEVEL", "INFO"))
         
         # Configuration
-        self.port = environ.get("APP_PORT")
+        self.port = environ.get("APP_PORT", 3000)
         self.debug = bool(environ.get("APP_DEBUG", False))
-        self.hf_token = environ.get("HF_TOKEN")
-        self.media_folder = Path(environ.get("MEDIA_FOLDER")).resolve()
+        self.hf_token = environ.get("HF_TOKEN", None)
+        self.media_folder = Path(environ.get("MEDIA_FOLDER", "")).resolve()
         self.chunk_length_ms = int(environ.get("CHUNK_LENGTH_MS", 200000))
         
         # File extensions
@@ -46,6 +47,7 @@ class TranscriberApp:
         
         self.model_config = ModelConfig(
             language="ru",
+            model_name="large-v2",
             batch_size=int(environ.get("BATCH_SIZE", 16)), 
             compute_type=environ.get("COMPUTE_TYPE", "float16")
         )
@@ -69,7 +71,7 @@ class TranscriberApp:
     def process_audio(self, audio_file: Path, speakers_from_to: Optional[Tuple[int, int]] = None):
         with self.manage_resources():
             model = whisperx.load_model(
-                "large-v2", 
+                self.model_config.model_name,
                 self.model_config.device,
                 language=self.model_config.language,
                 compute_type=self.model_config.compute_type
@@ -240,7 +242,7 @@ def main():
         # Preload models
         try:
             whisperx.load_model(
-                "large-v2",
+                app.model_config.model_name,
                 app.model_config.device,
                 language=app.model_config.language,
                 compute_type=app.model_config.compute_type
