@@ -12,261 +12,253 @@ import shutil
 from flask import Flask, request, Response, jsonify
 import sys
 import logging
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import contextlib
+from dotenv import load_dotenv
 
-# from natsort import natsorted
+@dataclass
+class ModelConfig:
+    language: str
+    batch_size: int
+    compute_type: str
+    device: str = "cuda" 
 
-APP_PORT = environ.get("APP_PORT")
-APP_DEBUG = environ.get("APP_DEBUG", False)
-HF_TOKEN = environ.get("HF_TOKEN")
-MEDIA_FOLDER = environ.get("MEDIA_FOLDER")
-lock_extender = ".lock"
-transcripted_extender = "_transcription.txt"
-errorfile_extender = "_error.log"
-chunks_extender = "_chunks"
-
-model_config = {
-    "language": "ru",
-    "batch_size": int(environ.get("BATCH_SIZE", 16)),
-    "compute_type": environ.get("COMPUTE_TYPE", "float16"),
-    "device": "cuda",
-}
-
-app = Flask(__name__)
-logger = logging.getLogger(__name__)
-logger.setLevel(environ.get("LOGGING_LEVEL", "INFO"))
-
-
-def create_chunks(chunk_length_ms, chunks_folder, source_filename):
-    # Prepare file to not overload CUDA
-    chunk_names = []
-    myaudio = AudioSegment.from_file(path.join(MEDIA_FOLDER, source_filename))
-    chunks = make_chunks(myaudio, chunk_length_ms)
-
-    audio_name, ext = path.splitext(source_filename)
-
-    try:
-        shutil.rmtree(chunks_folder)
-    except FileNotFoundError:
-        pass
-
-    try:
-        mkdir(chunks_folder)
-    except FileExistsError:
-        pass
-
-    audio_extention = "wav"
-    logger.debug(f"{chunks_folder=}")
-    for i, chunk in enumerate(chunks):
-        chunk_name = "{0}_chunk{1}.{2}".format(audio_name, i, audio_extention)
-        logger.debug(f"exporting {chunk_name}")
-        chunk.export(path.join(chunks_folder, chunk_name), format=audio_extention)
-        chunk_names.append(chunk_name)
-
-    # if chunks was already created
-    # chunk_names = natsorted(listdir(chunks_folder))
-
-    return chunk_names
-
-
-def process_audio(audio_file, speakers_from_to: tuple):
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    language_code, batch_size, compute_type, device = model_config.values()
-    # 1. Transcribe with original whisper (batched)
-    model = whisperx.load_model(
-        "large-v2", device, language=language_code, compute_type=compute_type
-    )
-
-    # save model to local path (optional)
-    # model_dir = "/path/"
-    # model = whisperx.load_model("large-v2", device, compute_type=compute_type, download_root=model_dir)
-    audio = whisperx.load_audio(audio_file)
-    result = model.transcribe(audio, language=language_code, batch_size=batch_size)
-    # print(result["segments"])  # before alignment
-    # print("lang: ", result["language"])
-
-    # 2. Align whisper output
-    model_a, metadata = whisperx.load_align_model(
-        language_code=language_code, device=device
-    )
-    result = whisperx.align(
-        result["segments"],
-        model_a,
-        metadata,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
-
-    # print(result["segments"])  # after alignment
-
-    if speakers_from_to:
-        # 3. Assign speaker labels
-        diarize_model = whisperx.DiarizationPipeline(
-            use_auth_token=HF_TOKEN, device=device
+class TranscriberApp:
+    def __init__(self):
+        self.app = Flask(__name__)
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(environ.get("LOGGING_LEVEL", "INFO"))
+        
+        # Configuration
+        self.port = environ.get("APP_PORT")
+        self.debug = bool(environ.get("APP_DEBUG", False))
+        self.hf_token = environ.get("HF_TOKEN")
+        self.media_folder = Path(environ.get("MEDIA_FOLDER")).resolve()
+        self.chunk_length_ms = int(environ.get("CHUNK_LENGTH_MS", 200000))
+        
+        # File extensions
+        self.lock_ext = ".lock"
+        self.transcription_ext = "_transcription.txt"
+        self.error_ext = "_error.log"
+        self.chunks_ext = "_chunks"
+        
+        self.model_config = ModelConfig(
+            language="ru",
+            batch_size=int(environ.get("BATCH_SIZE", 16)), 
+            compute_type=environ.get("COMPUTE_TYPE", "float16")
         )
+        
+        self.active_threads: Dict[str, threading.Thread] = {}
+        self.setup_routes()
 
-        # add min/max number of speakers if known
-        # diarize_segments = diarize_model(audio)
-        min_speakers = speakers_from_to[0]
-        max_speakers = speakers_from_to[1]
-        diarize_segments = diarize_model(
-            audio, min_speakers=min_speakers, max_speakers=max_speakers
-        )
+    def setup_routes(self):
+        self.app.route("/")(self.root_page)
+        self.app.route("/get_status", methods=["GET"])(self.get_status)
+        self.app.route("/get_transcription", methods=["GET"])(self.transcribe_from_mp3)
 
-        result = whisperx.assign_word_speakers(diarize_segments, result)
-
-    # delete model if low on GPU resources
-    # import gc
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model
-    # import gc
-
-    gc.collect()
-    torch.cuda.empty_cache()
-    del model_a
-
-    return result
-
-
-def transcribe(source_filename, speakers_count=None):
-    # audio_name = "deepai2611"
-    # audio_extention = "wav"
-    # source_file = audio_name + "." + audio_extention
-    audio_name, ext = path.splitext(source_filename)
-    chunks_folder = path.join(MEDIA_FOLDER, audio_name + chunks_extender)
-    transcription_file = path.join(MEDIA_FOLDER, audio_name + transcripted_extender)
-
-    chunk_names = create_chunks(
-        chunk_length_ms=int(environ.get("CHUNK_LENGTH_MS", 200000)),
-        chunks_folder=chunks_folder,
-        source_filename=source_filename,
-    )
-    logger.debug(f'JOBS TODAY: {", ".join(chunk_names)}')
-
-    try:
-        remove(transcription_file)
-    except FileNotFoundError:
-        pass
-
-    if speakers_count:
-        speakers_from_to = (1, speakers_count or 3)
-    else:
-        speakers_from_to = ()
-
-    for chunk_name in chunk_names:
-        audio_file = path.join(chunks_folder, chunk_name)
-        logger.debug(f">> processing {audio_file}")
+    @contextlib.contextmanager
+    def manage_resources(self):
         try:
-            result = process_audio(audio_file, speakers_from_to=speakers_from_to)
-        except RuntimeError as e:
-            with open(audio_name + errorfile_extender, "a+") as f:
-                f.write(f"{audio_file} {e}\n")
-            logger.exception(e)
+            yield
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        # print("diarize_segments: ", diarize_segments)
-        with open(transcription_file, "a+") as f:
-            for segment in result["segments"]:
-                # print("SEGMENT: ", segment, "\r\n")
-                if "speaker" in segment:
-                    f.write("\r\n" + segment["speaker"] + ": " + segment["text"])
-                else:
-                    f.write("\r\n" + segment["text"])
-        logger.debug(f"result written to {transcription_file}")
-
-    remove(path.join(MEDIA_FOLDER, source_filename) + lock_extender)
-
-
-@app.route("/", methods=["GET"])
-def root_page():
-    return Response("OK")
-
-
-@app.route("/get_status", methods=["GET"])
-def get_status():
-    status_filename = request.values.get("statusfile", None)
-    filename, ext = path.splitext(status_filename.replace(lock_extender, ""))
-    if path.exists(filename + errorfile_extender):
-        with open(filename + errorfile_extender, "r") as f:
-            error_message = f.read()
-        return jsonify({"status": "ERROR", "message": f"Error in transcription process: {error_message}"})
-
-    if path.exists(path.join(MEDIA_FOLDER, status_filename)):
-        return jsonify({"status": "IN PROGRESS"})
-    else:
-        try:
-            transcription_file = filename + transcripted_extender
-            with open(path.join(MEDIA_FOLDER, transcription_file), "r") as f:
-                transcription_text = f.read()
-
-            # remove artifacts
-            shutil.rmtree(path.join(MEDIA_FOLDER, filename + chunks_extender))
-            remove(path.join(MEDIA_FOLDER, transcription_file))
-
-            return jsonify(
-                {"status": "OK", "transcription_text": transcription_text.strip()}
+    def process_audio(self, audio_file: Path, speakers_from_to: Optional[Tuple[int, int]] = None):
+        with self.manage_resources():
+            model = whisperx.load_model(
+                "large-v2", 
+                self.model_config.device,
+                language=self.model_config.language,
+                compute_type=self.model_config.compute_type
             )
+
+            audio = whisperx.load_audio(str(audio_file))
+            result = model.transcribe(
+                audio,
+                language=self.model_config.language,
+                batch_size=self.model_config.batch_size
+            )
+
+            model_a, metadata = whisperx.load_align_model(
+                language_code=self.model_config.language,
+                device=self.model_config.device
+            )
+            
+            result = whisperx.align(
+                result["segments"],
+                model_a,
+                metadata,
+                audio,
+                self.model_config.device,
+                return_char_alignments=False
+            )
+
+            if speakers_from_to:
+                diarize_model = whisperx.DiarizationPipeline(
+                    use_auth_token=self.hf_token,
+                    device=self.model_config.device
+                )
+                diarize_segments = diarize_model(
+                    audio,
+                    min_speakers=speakers_from_to[0],
+                    max_speakers=speakers_from_to[1]
+                )
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+
+        return result
+
+    def create_chunks(self, source_filename: str) -> List[str]:
+            audio_stem = Path(source_filename).stem
+            chunks_folder = self.media_folder / f"{audio_stem}{self.chunks_ext}"
+            
+            with contextlib.suppress(FileNotFoundError):
+                shutil.rmtree(chunks_folder)
+            
+            chunks_folder.mkdir(exist_ok=True)
+            
+            myaudio = AudioSegment.from_file(self.media_folder / source_filename)
+            chunks = make_chunks(myaudio, self.chunk_length_ms)
+
+            chunk_names = []
+            for i, chunk in enumerate(chunks):
+                chunk_name = f"{audio_stem}_chunk{i}.wav"
+                self.logger.debug(f"exporting {chunk_name}")
+                chunk.export(chunks_folder / chunk_name, format="wav")
+                chunk_names.append(chunk_name)
+
+            return chunk_names
+
+    def transcribe(self, source_filename: str, speakers_count: Optional[int] = None) -> None:
+        try:
+            audio_stem = Path(source_filename).stem
+            chunks_folder = self.media_folder / f"{audio_stem}{self.chunks_ext}"
+            transcription_file = self.media_folder / f"{audio_stem}{self.transcription_ext}"
+
+            chunk_names = self.create_chunks(source_filename)
+            self.logger.debug(f'Processing chunks: {", ".join(chunk_names)}')
+
+            speakers_from_to = (1, speakers_count or 3) if speakers_count else None
+
+            with transcription_file.open('w') as f:
+                for chunk_name in chunk_names:
+                    audio_file = chunks_folder / chunk_name
+                    self.logger.debug(f"Processing {audio_file}")
+                    
+                    try:
+                        result = self.process_audio(audio_file, speakers_from_to)
+                        for segment in result["segments"]:
+                            text = f"\n{segment['speaker']}: {segment['text']}" if 'speaker' in segment else f"\n{segment['text']}"
+                            f.write(text)
+                    except RuntimeError as e:
+                        error_file = self.media_folder / f"{audio_stem}{self.error_ext}"
+                        error_file.write_text(f"{audio_file} {str(e)}\n")
+                        self.logger.exception(e)
+                        break
+
+        finally:
+            if source_filename in self.active_threads:
+                del self.active_threads[source_filename]
+            
+            lock_file = self.media_folder / f"{source_filename}{self.lock_ext}"
+            with contextlib.suppress(FileNotFoundError):
+                lock_file.unlink()
+
+    # Flask routes
+    def root_page(self):
+        return Response("OK")
+
+    def get_status(self):
+        status_filename = request.values.get("statusfile")
+        if not status_filename:
+            return jsonify({"status": "ERROR", "message": "No status filename provided"})
+
+        base_path = Path(status_filename.replace(self.lock_ext, ""))
+        error_file = self.media_folder / f"{base_path.stem}{self.error_ext}"
+        
+        if error_file.exists():
+            error_message = error_file.read_text()
+            return jsonify({"status": "ERROR", "message": f"Error in transcription process: {error_message}"})
+
+        if (self.media_folder / status_filename).exists():
+            return jsonify({"status": "IN PROGRESS"})
+
+        try:
+            transcription_file = self.media_folder / f"{base_path.stem}{self.transcription_ext}"
+            transcription_text = transcription_file.read_text()
+
+            shutil.rmtree(self.media_folder / f"{base_path.stem}{self.chunks_ext}")
+            transcription_file.unlink()
+
+            return jsonify({"status": "OK", "transcription_text": transcription_text.strip()})
         except FileNotFoundError as e:
-            logger.exception(f"Transcription {path.join(MEDIA_FOLDER, transcription_file)} not found\n\n{e}")
-            return jsonify(
-                {
-                    "status": "ERROR",
-                    "message": f"Transcription {transcription_file} not found",
-                }
-            )
+            self.logger.exception(f"Transcription {transcription_file} not found\n\n{e}")
+            return jsonify({"status": "ERROR", "message": f"Transcription {transcription_file} not found"})
 
+    def transcribe_from_mp3(self):
+        audio_name = request.values.get("audio_name")
+        if not audio_name:
+            return jsonify({"status": "ERROR", "message": "No audio_name provided"})
 
-@app.route("/get_transcription", methods=["GET"])
-def transcribe_from_mp3():
-    audio_name = request.values.get("audio_name", None)
+        filepath = self.media_folder / audio_name
+        if not filepath.exists():
+            return jsonify({"status": "ERROR", "message": f"File {filepath} not found on host"})
 
-    if not audio_name:
-        return jsonify({"status": "ERROR", "message": "No audio_name provided"})
+        # Check if thread already exists and is running
+        if audio_name in self.active_threads:
+            thread = self.active_threads[audio_name]
+            if thread.is_alive():
+                return jsonify({"status": "IN_PROGRESS", "message": f"Transcription for {audio_name} is already running"})
+            else:
+                # Clean up completed thread
+                del self.active_threads[audio_name]
 
-    filepath = path.join(MEDIA_FOLDER, audio_name)
-    if not path.exists(filepath):
-        return jsonify(
-            {"status": "ERROR", "message": f"File {filepath} not found on host"}
+        transcribe_thread = threading.Thread(
+            target=self.transcribe,
+            name=f"Transcriber {audio_name}",
+            args=(audio_name, None),
         )
+        transcribe_thread.start()
+        self.active_threads[audio_name] = transcribe_thread
+        
+        statusfile = f"{audio_name}{self.lock_ext}"
+        try:
+            (self.media_folder / statusfile).touch()
+        except FileExistsError:
+            pass
+            
+        return jsonify({"status": "OK", "statusfile": statusfile})
 
-    # speakers_count = request.values.get("speakers_count", None)
-    transcribe_thread = threading.Thread(
-        target=transcribe,
-        name=f"Transcriber {audio_name}",
-        args=(audio_name, None),
-    )
-    transcribe_thread.start()
-    statusfile = audio_name + lock_extender
-    try:
-        mknod(path.join(MEDIA_FOLDER, statusfile))
-    except FileExistsError:
-        pass
-    # transcription_text = transcribe(audio_path, speakers_count)
-    return jsonify({"status": "OK", "statusfile": statusfile})
-
+    def run(self):
+        self.app.run(debug=bool(self.debug), host="::", port=self.port)
 
 def main():
-    app.run(debug=bool(APP_DEBUG), host="::", port=APP_PORT)
-
-
-if __name__ == "__main__":
-    try:
-        # pass someth to load models
-        sys.argv[1]
-        language_code, batch_size, compute_type, device = model_config.values()
+    app = TranscriberApp()
+    if len(sys.argv) > 1:
+        # Preload models
         try:
             whisperx.load_model(
-                "large-v2", device, language=language_code, compute_type=compute_type
+                "large-v2",
+                app.model_config.device,
+                language=app.model_config.language,
+                compute_type=app.model_config.compute_type
             )
         except RuntimeError:
             pass
 
         try:
-            whisperx.load_align_model(language_code=language_code, device=device)
+            whisperx.load_align_model(
+                language_code=app.model_config.language,
+                device=app.model_config.device
+            )
         except RuntimeError:
             pass
-    except IndexError:
-        main()
+    else:
+        app.run()
+
+if __name__ == "__main__":
+    if environ.get("MODE") == "DEV":
+        load_dotenv()
+    main()
