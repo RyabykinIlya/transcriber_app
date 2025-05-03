@@ -1,6 +1,6 @@
 # Audio to speech transcriber
 
-локальный транскрибатор, разбивает аудио на части и транскрибирует используя whisperX: https://github.com/m-bain/whisperX
+локальный транскрибатор, разбивает аудио на части и транскрибирует используя whisperX: https://github.com/m-bain/whisperX  
 скопируйте .env_example в .env, измените значения переменных
 
 Если вы в РФ, то wget, apt install и pip install с сайтов nvidia будет падать из-за недоступности, поэтому нужно использовать прокси, включаем или выключаем в
