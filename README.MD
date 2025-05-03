@@ -37,6 +37,7 @@ curl http://0.0.0.0:8565/get_status?statusfile=2025-01-19_22-54-48.mp3.lock
 ```
 .wgetrc
 apt.conf
+pip.conf
 ```
 
 ### Size of image layers:
