@@ -1,5 +1,17 @@
 # Audio to speech transcriber
 
+локальный транскрибатор, разбивает аудио на части и транскрибирует используя whisperX: https://github.com/m-bain/whisperX
+скопируйте .env_example в .env, измените значения переменных
+
+Если вы в РФ, то wget, apt install и pip install с сайтов nvidia будет падать из-за недоступности, поэтому нужно использовать прокси, включаем или выключаем в
+```
+.wgetrc
+apt.conf
+pip.conf
+```
+
+у меня работает на 3070ti для любого размера и длины аудио с текущими параметрами. если у вас будет падать с ошибкой "недостаточно памяти" - уменьшайте CHUNK_LENGTH_MS в .env
+
 ### Build image
 ```
 docker build -t audio-transcriber .
@@ -31,13 +43,6 @@ curl http://0.0.0.0:8565/get_status?statusfile=2025-01-19_22-54-48.mp3.lock
   "status": "OK",
   "transcription_text": "<text here>"
 }
-```
-
-Если вы в РФ, то wget и apt install с сайтов nvidia будет падать из-за недоступности, поэтому нужно использовать прокси, включаем или выключаем в
-```
-.wgetrc
-apt.conf
-pip.conf
 ```
 
 ### Size of image layers:
