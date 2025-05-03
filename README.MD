@@ -33,6 +33,12 @@ curl http://0.0.0.0:8565/get_status?statusfile=2025-01-19_22-54-48.mp3.lock
 }
 ```
 
+Если вы в РФ, то wget и apt install с сайтов nvidia будет падать из-за недоступности, поэтому нужно использовать прокси, включаем или выключаем в
+```
+.wgetrc
+apt.conf
+```
+
 ### Size of image layers:
 |CMD|SIZE|
 |---|---|
