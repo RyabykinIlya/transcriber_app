@@ -24,6 +24,7 @@ docker run -d --name audio-transcriber \
 | `APP_DEBUG` | Flask debug | `False` |
 | `MEDIA_FOLDER` | Папка с аудио и артефактами (`.lock`, `_transcription.txt`, `_chunks/`, `_error.log`) | — |
 | `CHUNK_LENGTH_MS` | Длина чанка при нарезке | `120000` |
+| `CHUNK_OVERLAP_MS` | Перекрытие соседних чанков (нужно, чтобы слова на границе не обрезались) | `3000` |
 | `BATCH_SIZE` | Whisper batch size | `8` |
 | `COMPUTE_TYPE` | Whisper compute type | `float16` |
 | `HF_TOKEN` | Токен HuggingFace (нужен для диаризации) | — |
@@ -37,7 +38,7 @@ docker run -d --name audio-transcriber \
 
 Пайплайн один и тот же для всех способов запуска:
 1. создаётся `.lock`-файл — признак «в работе»;
-2. исходник режется на чанки (`CHUNK_LENGTH_MS`) в подпапку `{stem}_chunks/`;
+2. исходник режется на чанки (`CHUNK_LENGTH_MS`) в подпапку `{stem}_chunks/` с перекрытием `CHUNK_OVERLAP_MS` — каждый следующий чанк начинается на `overlap` мс раньше конца предыдущего, чтобы слова на границе не обрезались. Дубли из зоны overlap отбрасываются при сборке результата (у каждого чанка, кроме последнего, обрезаются сегменты, попадающие в хвостовой overlap — их «чистую» версию выдаёт следующий чанк с полным контекстом впереди);
 3. каждый чанк прогоняется через Whisper + align (опционально диаризация);
 4. результат пишется в `{stem}_transcription.txt`;
 5. `.lock` снимается по завершении; при ошибке пишется `{stem}_error.log`.
@@ -65,19 +66,22 @@ Health check. Возвращает `OK`.
 curl "http://0.0.0.0:8565/get_transcription?audio_name=2025-01-19_22-54-48.mp3"
 ```
 
-### `POST /upload_and_transcribe` (планируется)
-Принимает файл multipart-ом, сохраняет его в `MEDIA_FOLDER` и запускает тот же пайплайн транскрибации. Нужен, чтобы внешние сервисы могли слать записи, не монтируя общий volume.
+### `POST /upload_and_transcribe`
+Синхронный эндпоинт для внешних сервисов: принимает файл multipart-ом, прогоняет его через тот же пайплайн (chunk → Whisper → align) и возвращает текст прямо в ответе. Никакие артефакты в `MEDIA_FOLDER` не остаются — файл и чанки живут во временной директории и удаляются по завершении запроса.
+
+Поведение при занятости: если параллельно уже идёт другая транскрибация, запрос **не обрывается** — сервис ждёт освобождения внутреннего лока до 10 секунд. Если за это время очередь не освободилась, возвращается `503 BUSY` (безопасно повторить позже).
 
 Запрос:
 - `Content-Type: multipart/form-data`
 - поле `file` — аудио-файл (обязательно)
-- поле `audio_name` — желаемое имя файла на диске (опционально, по умолчанию берётся имя загружаемого файла)
+- поле `speakers_count` — включает диаризацию с `max_speakers=N` (опционально)
 
-Ответ:
+Ответы:
 ```
-200 {"status": "OK", "audio_name": "...", "statusfile": "{audio_name}.lock"}
-200 {"status": "IN_PROGRESS", "message": "..."}
-400 {"status": "ERROR", "message": "No file provided"}
+200 {"status": "OK", "transcription_text": "<текст>"}
+400 {"status": "ERROR", "message": "No file provided ..."}
+503 {"status": "BUSY", "message": "Another transcription is in progress, try again later"}
+500 {"status": "ERROR", "message": "<exception>"}
 ```
 
 Пример:
@@ -86,13 +90,13 @@ curl -X POST http://0.0.0.0:8565/upload_and_transcribe \
   -F "file=@./meeting.mp3"
 ```
 
-После запуска — как обычно, поллить `/get_status` по `statusfile` из ответа.
+Замечание: транскрибация выполняется в рамках HTTP-запроса целиком, поэтому на клиенте нужно выставить достаточный read timeout (обычно несколько минут на час записи).
 
 ### `GET /get_status`
 Опрос статуса ранее запущенной транскрибации.
 
 Параметры:
-- `statusfile` — значение из ответа `/get_transcription` или `/upload_and_transcribe` (`{audio_name}.lock`).
+- `statusfile` — значение из ответа `/get_transcription` (`{audio_name}.lock`).
 
 Ответы:
 ```
