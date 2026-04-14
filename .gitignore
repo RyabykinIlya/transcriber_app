@@ -1,2 +1,4 @@
 .env
 venv
+app/docker-cache/
+.env-docker
