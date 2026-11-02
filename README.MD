@@ -2,6 +2,18 @@
 
 HTTP-сервис поверх WhisperX для транскрибации аудио. Работает с файлами, лежащими в смонтированной `MEDIA_FOLDER` (см. `-v` при запуске контейнера).
 
+Под капотом — whisperX: https://github.com/m-bain/whisperX. Скопируйте `.env_example` в `.env`, измените значения переменных.
+
+Если вы в РФ, то `wget`, `apt install` и `pip install` с сайтов nvidia будут падать из-за недоступности, поэтому нужно использовать прокси — включаем или выключаем в `Dockerfile` (строки `COPY .wgetrc`, `apt.conf`, `pip.conf`):
+
+```
+.wgetrc
+apt.conf
+pip.conf
+```
+
+Работает на 3070 Ti для любого размера и длины аудио с текущими параметрами. Если падает с ошибкой «недостаточно памяти» — уменьшайте `CHUNK_TARGET_MS` / `CHUNK_MAX_MS` в `.env` (нарезка адаптивная, см. ниже).
+
 ## Build image
 ```
 docker build -t audio-transcriber app -f Dockerfile
