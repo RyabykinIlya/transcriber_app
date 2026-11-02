@@ -1,0 +1,6 @@
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-49-42.ogg'
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-51-05.ogg'
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-51-27.ogg'
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-51-36.ogg'
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-51-44.ogg'
+file '/home/ilya/home/whisperx/transcriber_app/audio_2026-10-22_20-53-00.ogg'

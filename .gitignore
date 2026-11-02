@@ -2,3 +2,11 @@
 venv
 app/docker-cache/
 .env-docker
+.abtest/__pycache__/
+*.py[cod]
+*.ogg
+*.wav
+*.mp3
+
+# local A/B test audio samples
+.abtest/*.wav

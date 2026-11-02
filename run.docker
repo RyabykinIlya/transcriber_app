@@ -1,1 +1,8 @@
-docker run -d --name audio-transcriber --env-file /home/ilya/home/whisperx/transcriber_app/.env-docker --restart unless-stopped --gpus all -p 8565:8565 -v /mnt/d/meeting_records/audio/:/records audio-transcriber
+docker run -d --name audio-transcriber \
+  --env-file /home/ilya/home/whisperx/transcriber_app/.env-docker \
+  --restart unless-stopped \
+  --gpus all \
+  -p 8565:8565 \
+  -v /mnt/d/meeting_records/audio/:/records \
+  -v transcriber-hf-cache:/root/.cache/huggingface \
+  audio-transcriber
