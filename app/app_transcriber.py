@@ -62,6 +62,8 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from werkzeug.utils import secure_filename
 
+import voiceprints
+
 SAMPLE_RATE = 16000
 
 
@@ -169,6 +171,7 @@ class TranscriberApp:
         # File extensions / artifact suffixes (kept for API compatibility)
         self.lock_ext = ".lock"
         self.transcription_ext = "_transcription.txt"
+        self.speakers_ext = "_speakers.json"
         self.error_ext = "_error.log"
         self.chunks_ext = "_chunks"  # legacy on-disk chunks, cleaned up if found
 
@@ -202,12 +205,17 @@ class TranscriberApp:
         self._diarize_pipeline = None
 
         # Speaker identification (optional, see /enroll_voice).
-        self._voiceprint: Optional[Dict] = None  # lazy, from voiceprint.json
+        self._voiceprints: Optional[List[Dict]] = None  # lazy, from voiceprints.json
+        self._gallery_lock = threading.Lock()
         self.speaker_name = environ.get("SPEAKER_NAME", "Илья Рябыкин")
         # Calibration (cosine): own clean voice ~1.0, own voice in a real
         # meeting ~0.71 (worse mic/compression), other people 0.13-0.37.
         # 0.60 sits in the middle of that gap.
         self.voice_match_threshold = float(environ.get("VOICE_MATCH_THRESHOLD", "0.60"))
+        # Сколько голосов максимум искать в записи. Раньше здесь жёстко стояло
+        # 3 (и это резало любую встречу до трёх голосов, потому что
+        # tg_assistant не передаёт speakers_count). Теперь решает env.
+        self.diarize_max_speakers = max(1, _env_int("DIARIZE_MAX_SPEAKERS", 8))
 
         self.setup_routes()
 
@@ -314,95 +322,93 @@ class TranscriberApp:
         self.logger.info("Diarization pipeline released (VRAM returned to the whisper pool)")
 
     # ------------------------------------------------------------------ #
-    # Speaker identification (voiceprint)
+    # Speaker identification (voice gallery)
     # ------------------------------------------------------------------ #
+    #
+    # Галерея голосов: MEDIA_FOLDER/voiceprints.json (см. VOICEPRINTS_CONTRACT.md).
+    # Вся логика (слияние, матчинг, окна) — в app/voiceprints.py, здесь только
+    # файловый ввод-вывод, кэш и работа с пайплайном.
 
+    VOICEPRINTS_FILE = "voiceprints.json"
+    # Легаси-файл одного слепка: читается как галерея из одной записи и НЕ
+    # удаляется — просто перестаёт использоваться после первой записи галереи.
     VOICEPRINT_FILE = "voiceprint.json"
 
-    def _voiceprint_path(self) -> Path:
+    def _gallery_path(self) -> Path:
+        return self.media_folder / self.VOICEPRINTS_FILE
+
+    def _legacy_voiceprint_path(self) -> Path:
         return self.media_folder / self.VOICEPRINT_FILE
 
-    def _load_voiceprint(self) -> Optional[Dict]:
-        if self._voiceprint is not None:
-            return self._voiceprint
-        try:
-            with open(self._voiceprint_path(), encoding="utf-8") as fh:
-                data = json.load(fh)
-            emb = data.get("embedding")
-            if not emb or not isinstance(emb, list) or len(emb) < 1:
-                raise ValueError("voiceprint file has no embedding")
-            self._voiceprint = {
-                "name": str(data.get("name") or "Илья Рябыкин"),
-                "embedding": np.asarray(emb, dtype=np.float32),
-                "enrolled_at": data.get("enrolled_at", ""),
-            }
-            self.logger.info(
-                f"Voiceprint loaded: {self._voiceprint['name']} "
-                f"(dim={len(emb)}, enrolled {self._voiceprint['enrolled_at']})"
-            )
-        except FileNotFoundError:
-            self._voiceprint = None
-        except Exception as e:
-            self.logger.warning(f"Ignoring broken voiceprint file: {type(e).__name__}: {e}")
-            self._voiceprint = None
-        return self._voiceprint
+    def _load_gallery(self) -> List[Dict]:
+        """Текущая галерея (кэш в памяти, инвалидируется записью).
 
-    def _save_voiceprint(self, name: str, embedding: List[float]) -> None:
-        payload = {
-            "name": name,
-            "embedding": [float(x) for x in embedding],
-            "enrolled_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        tmp = self._voiceprint_path().with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
-        tmp.replace(self._voiceprint_path())
-        self._voiceprint = None  # force reload on next use
+        Если `voiceprints.json` нет или он пуст, читается легаси
+        `voiceprint.json` как галерея из одной записи с именем `SPEAKER_NAME`.
+        """
+        with self._gallery_lock:
+            if self._voiceprints is not None:
+                return self._voiceprints
+
+            gallery = voiceprints.load_gallery_file(self._gallery_path())
+            if gallery:
+                self.logger.info(
+                    f"Voice gallery loaded: {len(gallery)} speaker(s) from {self.VOICEPRINTS_FILE}"
+                )
+            else:
+                gallery = voiceprints.load_gallery_file(self._legacy_voiceprint_path())
+                if gallery:
+                    for entry in gallery:
+                        if not entry.get("name"):
+                            entry["name"] = self.speaker_name
+                    self.logger.info(
+                        f"Voice gallery: using legacy {self.VOICEPRINT_FILE} as a "
+                        f"single-entry gallery ('{gallery[0]['name']}'); it is ignored "
+                        f"once {self.VOICEPRINTS_FILE} is written"
+                    )
+            self._voiceprints = gallery
+            return gallery
+
+    def _save_gallery(self, gallery: List[Dict]) -> None:
+        with self._gallery_lock:
+            voiceprints.save_gallery_file(self._gallery_path(), gallery)
+            self._voiceprints = list(gallery)
+
+    def _speakers_path(self, audio_stem: str) -> Path:
+        return self.media_folder / f"{audio_stem}{self.speakers_ext}"
+
+    def _match_speakers(self, df, embeddings: Dict) -> Tuple[Dict[str, str], Dict[str, float], Dict[str, str], Dict]:
+        """Сопоставить кластеры диаризации с галереей, залогировать каждый скор.
+
+        Возвращает (renames, scores, names, vectors) — см. voiceprints.identify_speakers.
+        """
+        gallery = self._load_gallery()
+        if not embeddings:
+            return {}, {}, {}, {}
+
+        # У сегмента в df две метки: сырая `label` (ключ эмбеддингов) и
+        # публичная `speaker` (SPEAKER_XX) — переименовываем публичную.
+        label2speaker: Dict[str, str] = {}
+        for row in df.to_dict("records"):
+            label2speaker.setdefault(str(row.get("label")), str(row.get("speaker")))
+
+        renames, scores, names, vectors = voiceprints.identify_speakers(
+            embeddings, label2speaker, gallery, self.voice_match_threshold
+        )
+        for speaker, score in sorted(scores.items()):
+            matched = names.get(speaker)
+            level = " => matched" if matched else " (below threshold)"
+            self.logger.info(
+                f"Voice match {speaker} vs '{matched or 'gallery'}': "
+                f"cos={score:.3f}{level} ({len(gallery)} in gallery)"
+            )
+        return renames, scores, names, vectors
 
     @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
-        if na < 1e-8 or nb < 1e-8:
-            return 0.0
-        return float(np.dot(a, b) / (na * nb))
-
-    def _identify_speakers(
-        self,
-        df,
-        embeddings: Dict,
-        name: str,
-        enroll_embedding: np.ndarray,
-        threshold: float,
-    ) -> Tuple[Dict[str, str], Dict[str, float]]:
-        """Map each SPEAKER_XX to the enrolled name (or keep the id).
-
-        whisperx `speaker_embeddings` keys are the raw diarization labels
-        ('A', 'B', ...), NOT int indices. The df carries both: raw `label`
-        and public `speaker` (SPEAKER_XX) — the rename targets the latter.
-
-        Returns (renames, scores) where renames[SPEAKER_XX]=name_or_id and
-        scores[SPEAKER_XX]=best cosine similarity.
-        """
-        if not embeddings:
-            return {}, {}
-        label2speaker: Dict[str, str] = {}
-        for _, row in df.iterrows():
-            label2speaker.setdefault(row["label"], row["speaker"])
-
-        renames: Dict[str, str] = {}
-        scores: Dict[str, float] = {}
-        for label, emb in embeddings.items():
-            vec = np.asarray(emb, dtype=np.float32).reshape(-1)
-            speaker = label2speaker.get(label, str(label))
-            if vec.size != enroll_embedding.size:
-                self.logger.warning(f"Embedding dim mismatch for {label} ({vec.size} vs {enroll_embedding.size})")
-                continue
-            sim = self._cosine_similarity(vec, enroll_embedding)
-            scores[speaker] = sim
-            renames[speaker] = name if sim >= threshold else speaker
-            level = " => matched" if sim >= threshold else " (below threshold)"
-            self.logger.info(f"Voice match {label}/{speaker} vs '{name}': cos={sim:.3f}{level}")
-        return renames, scores
+    def _clear_speakers_file(path: Path) -> None:
+        """Убрать устаревший `_speakers.json` перед новой расшифровкой."""
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
 
     def preload_models(self):
         for loader in (self._get_whisper_model, self._get_align_model):
@@ -636,9 +642,10 @@ class TranscriberApp:
         if progress:
             progress(stage="transcribing")
 
-        # Diarization: run when explicitly requested OR when a voiceprint is
-        # enrolled (then it must run so we can tag the owner's speech).
-        voiceprint = self._load_voiceprint()
+        # Диаризация: запускается, если её попросили явно ИЛИ если галерея
+        # голосов непуста (тогда она обязана отработать, чтобы подписать
+        # знакомые голоса именами).
+        gallery = self._load_gallery()
         # NOTE on stage order: transcription runs FIRST, diarization LAST.
         # The pyannote pipeline stays resident (~1-2GB VRAM) once loaded; if
         # it runs before transcription, whisper ends up transcribing against
@@ -679,32 +686,45 @@ class TranscriberApp:
             del result
             self._cleanup_gpu()
 
-        # Diarization: run when explicitly requested OR when a voiceprint is
-        # enrolled (then it must run so we can tag the owner's speech).
         diarization = None
         speaker_renames: Dict[str, str] = {}
-        if (speakers_from_to or voiceprint is not None) and any(all_segments):
+        speaker_scores: Dict[str, float] = {}
+        speaker_names: Dict[str, str] = {}
+        speaker_vectors: Dict[str, np.ndarray] = {}
+        if (speakers_from_to or gallery) and any(all_segments):
             try:
                 if progress:
                     progress(stage="diarization")
+                # Раньше здесь безусловно стояло max_speakers=3, и любая
+                # встреча без явного speakers_count резалась на три голоса.
+                # Теперь дефолт — DIARIZE_MAX_SPEAKERS (8).
+                min_speakers = speakers_from_to[0] if speakers_from_to else 1
+                max_speakers = (
+                    speakers_from_to[1] if speakers_from_to else self.diarize_max_speakers
+                )
+                self.logger.info(
+                    f"Diarization over the whole file "
+                    f"(speakers {min_speakers}..{max_speakers})"
+                )
                 pipeline = self._get_diarize_pipeline()
                 diarization, speaker_embeddings = pipeline(
                     audio,
-                    min_speakers=(speakers_from_to[0] if speakers_from_to else 1),
-                    max_speakers=(speakers_from_to[1] if speakers_from_to else 3),
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
                     return_embeddings=True,
                 )
                 self.logger.info("Diarization finished for the whole file")
-                if voiceprint is not None and speaker_embeddings is not None:
+                if speaker_embeddings is not None:
                     self.logger.info(f"Speaker labels found: {list(speaker_embeddings.keys())}")
-                    renames, _ = self._identify_speakers(
-                        diarization,
-                        speaker_embeddings,
-                        self.speaker_name,
-                        np.asarray(voiceprint["embedding"], dtype=np.float32),
-                        self.voice_match_threshold,
-                    )
-                    speaker_renames = renames
+                # Векторы спикеров отдаём наружу даже при пустой галерее: по ним
+                # tg_assistant делает ретро-разметку, когда коллегу зачислят позже.
+                if speaker_embeddings:
+                    (
+                        speaker_renames,
+                        speaker_scores,
+                        speaker_names,
+                        speaker_vectors,
+                    ) = self._match_speakers(diarization, speaker_embeddings)
             except Exception as e:
                 self.logger.exception(
                     f"Diarization failed ({type(e).__name__}: {e}); continuing without speakers"
@@ -715,7 +735,11 @@ class TranscriberApp:
                 # must not inherit a nearly-full GPU (see _release_diarizer).
                 self._release_diarizer()
 
-        # Speaker labels + voiceprint renaming, then emit everything in order.
+        # Speaker labels + gallery renaming, then emit everything in order.
+        # Строки для `speakers[]` собираются ДО переименования: контракт
+        # требует отдавать исходную метку SPEAKER_XX (по ней клиент ищет
+        # реплики в тексте).
+        speaker_rows: List[dict] = []
         for segments in all_segments:
             if diarization is not None and segments:
                 try:
@@ -725,19 +749,43 @@ class TranscriberApp:
                     segments = assigned.get("segments", segments)
                 except Exception as e:
                     self.logger.warning(f"Speaker assignment failed for a chunk: {e}")
-            if speaker_renames:
-                for seg in segments:
-                    spk = seg.get("speaker")
-                    if spk in speaker_renames:
-                        seg["speaker"] = speaker_renames[spk]
             for seg in segments:
+                spk = seg.get("speaker")
+                if spk:
+                    with contextlib.suppress(TypeError, ValueError):
+                        speaker_rows.append(
+                            {
+                                "speaker": str(spk),
+                                "start": float(seg.get("start", 0.0)),
+                                "end": float(seg.get("end", 0.0)),
+                            }
+                        )
+                if speaker_renames and spk in speaker_renames:
+                    seg["speaker"] = speaker_renames[spk]
                 sink(seg)
+
+        speakers = (
+            voiceprints.build_speakers(
+                speaker_rows, speaker_vectors, speaker_scores, speaker_names
+            )
+            if speaker_rows
+            else []
+        )
+        if speakers:
+            self.logger.info(
+                "Speakers: "
+                + ", ".join(
+                    f"{s['label']}={s['name'] or '?'} ({s['total_sec']}s, "
+                    f"{len(s['windows'])} window(s))"
+                    for s in speakers
+                )
+            )
 
         self.logger.info(
             f"Transcription finished: {len(ranges)} chunk(s), {len(failed)} failed, "
             f"{time.monotonic() - started:.1f}s total"
         )
-        return failed
+        return failed, speakers
 
     # ------------------------------------------------------------------ #
     # Job runners (async file job + sync upload job)
@@ -793,14 +841,20 @@ class TranscriberApp:
                 self._write_progress(lock_file, stage="decoding")
                 audio = self.decode_audio(self.media_folder / source_filename)
 
-                speakers_from_to = (1, speakers_count or 3) if speakers_count else None
+                speakers_from_to = (
+                    (1, max(1, speakers_count)) if speakers_count else None
+                )
+                # Устаревший _speakers.json от прошлого прогона этого же файла
+                # иначе переживёт новую расшифровку и соврёт про спикеров.
+                speakers_file = self._speakers_path(audio_stem)
+                self._clear_speakers_file(speakers_file)
 
                 def sink(segment: dict) -> None:
                     f.write(self._format_segment(segment))
 
                 with transcription_file.open("w") as f:
                     with self._override_asr_options(initial_prompt, hotwords):
-                        failed = self.transcribe_array(
+                        failed, speakers = self.transcribe_array(
                             audio,
                             speakers_from_to,
                             sink,
@@ -808,6 +862,10 @@ class TranscriberApp:
                         )
                     f.flush()
                 del audio
+
+                # _speakers.json переживает выдачу расшифровки — клиент опрашивает
+                # спикеров отдельно от текста (см. /get_status).
+                voiceprints.save_speakers_file(speakers_file, speakers)
 
                 if failed:
                     lines = [
@@ -838,24 +896,28 @@ class TranscriberApp:
         lock_timeout: float = 10.0,
         initial_prompt: Optional[str] = None,
         hotwords: Optional[str] = None,
-    ) -> Optional[str]:
-        """Synchronous pipeline for /upload_and_transcribe."""
+    ) -> Optional[Tuple[str, List[dict]]]:
+        """Synchronous pipeline for /upload_and_transcribe.
+
+        Возвращает `(текст, speakers)` либо None, если не дождались лока.
+        `speakers` — тот же массив, что отдаёт /get_status (контракт §1.3).
+        """
         acquired = self._transcription_lock.acquire(timeout=lock_timeout)
         if not acquired:
             return None
         try:
             audio = self.decode_audio(audio_path)
-            speakers_from_to = (1, speakers_count or 3) if speakers_count else None
+            speakers_from_to = (1, max(1, speakers_count)) if speakers_count else None
             parts: List[str] = []
             with self._override_asr_options(initial_prompt, hotwords):
-                failed = self.transcribe_array(
+                failed, speakers = self.transcribe_array(
                     audio, speakers_from_to, lambda seg: parts.append(self._format_segment(seg))
                 )
             del audio
             if failed and not parts:
                 a, b, e = failed[0]
                 raise RuntimeError(f"All chunks failed; first: [{fmt_ts(a)}-{fmt_ts(b)}] {type(e).__name__}: {e}")
-            return "".join(parts).strip()
+            return "".join(parts).strip(), speakers
         finally:
             self._transcription_lock.release()
 
@@ -869,74 +931,219 @@ class TranscriberApp:
         self.app.route("/get_transcription", methods=["GET"])(self.transcribe_from_mp3)
         self.app.route("/upload_and_transcribe", methods=["POST"])(self.upload_and_transcribe)
         self.app.route("/enroll_voice", methods=["POST"])(self.enroll_voice)
+        self.app.route("/voiceprints", methods=["GET"])(self.list_voiceprints)
+        self.app.route("/voiceprints/delete", methods=["POST"])(self.delete_voiceprint)
+        self.app.route("/voiceprints/match", methods=["GET", "POST"])(self.match_voiceprint)
+
+    # --- галерея голосов ---------------------------------------------- #
+
+    def _gallery_payload(self) -> List[Dict]:
+        """Публичное представление галереи: без эмбеддингов, по имени."""
+        entries = []
+        for entry in self._load_gallery():
+            entries.append(
+                {
+                    "id": entry.get("id"),
+                    "name": entry.get("name"),
+                    "samples": int(entry.get("samples") or 0),
+                    "sample_seconds": float(entry.get("sample_seconds") or 0.0),
+                    "created_at": entry.get("created_at") or "",
+                    "updated_at": entry.get("updated_at") or "",
+                }
+            )
+        entries.sort(key=lambda item: str(item.get("name") or "").casefold())
+        return entries
+
+    def list_voiceprints(self):
+        """GET /voiceprints — галерея без эмбеддингов, по имени."""
+        return jsonify({"status": "OK", "speakers": self._gallery_payload()})
+
+    def delete_voiceprint(self):
+        """POST /voiceprints/delete — удалить запись по `id` или по `name`."""
+        payload = request.get_json(silent=True) or {}
+        entry_id = request.values.get("id") or payload.get("id")
+        name = request.values.get("name") or payload.get("name")
+        if not entry_id and not name:
+            return jsonify({"status": "ERROR", "message": "No id or name provided"}), 400
+
+        gallery = self._load_gallery()
+        kept, deleted = voiceprints.delete_speaker(gallery, entry_id=entry_id, name=name)
+        if deleted is None:
+            return jsonify({"status": "ERROR", "message": "Not found"}), 404
+        self._save_gallery(kept)
+        self.logger.info(f"Voiceprint deleted: {deleted} (left {len(kept)} in gallery)")
+        return jsonify({"status": "OK", "deleted": deleted})
+
+    def match_voiceprint(self):
+        """GET /voiceprints/match?embedding=<json> — косинус против всей галереи."""
+        raw = request.values.get("embedding")
+        if not raw:
+            payload = request.get_json(silent=True) or {}
+            raw = payload.get("embedding")
+        if raw is None:
+            return jsonify({"status": "ERROR", "message": "No embedding provided"}), 400
+        try:
+            embedding = json.loads(raw) if isinstance(raw, str) else raw
+            probe = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        except (ValueError, TypeError) as e:
+            return jsonify({"status": "ERROR", "message": f"Bad embedding: {e}"}), 400
+        if probe.size == 0:
+            return jsonify({"status": "ERROR", "message": "Bad embedding: empty"}), 400
+
+        matches = voiceprints.score_gallery(probe, self._load_gallery())
+        return jsonify({"status": "OK", "matches": matches})
 
     def enroll_voice(self):
-        """POST /enroll_voice with `file` = 1-3 min of a single speaker.
+        """POST /enroll_voice — зачислить голос в галерею.
 
-        Computes a speaker embedding and stores it as voiceprint.json in
-        MEDIA_FOLDER. From then on diarization auto-runs on every file and
-        the matching speaker is labeled with SPEAKER_NAME.
+        Источник эмбеддинга — одно из двух:
+          * `audio_name` (файл в MEDIA_FOLDER) + `windows` = JSON-массив
+            [[start_sec, end_sec], ...]. Окна склеиваются с 0.15 с тишины между
+            ними, поэтому хватает нескольких коротких чистых реплик;
+          * `file` — загруженный файл (легаси-путь, как раньше).
+
+        Вектор считается диаризатором по склейке с max_speakers=1 и пишется в
+        MEDIA_FOLDER/voiceprints.json (повторное имя усредняет эмбеддинг).
         """
-        uploaded = request.files.get("file")
-        if uploaded is None or uploaded.filename == "":
+        name = (request.values.get("name") or "").strip()
+        if not name:
             return jsonify(
-                {"status": "ERROR", "message": "No file provided (expected multipart field 'file')"}
+                {"status": "ERROR", "message": "No name provided (expected field 'name')"}
             ), 400
 
-        name = (request.values.get("name") or self.speaker_name).strip()
-        with self._transcription_lock:
-            with tempfile.TemporaryDirectory(prefix="enroll_") as tmp:
-                audio_path = Path(tmp) / secure_filename(uploaded.filename or "sample.wav")
-                uploaded.save(audio_path)
-                self.logger.info(f"Enrolling voiceprint from {audio_path.name} for '{name}'")
-                try:
-                    audio = self.decode_audio(audio_path)
-                    pipeline = self._get_diarize_pipeline()
-                    df, embeddings = pipeline(
-                        audio,
-                        min_speakers=1,
-                        max_speakers=max(1, int(request.values.get("max_speakers", 2))),
-                        return_embeddings=True,
-                    )
-                except Exception as e:
-                    self.logger.exception(f"Enrollment failed: {e}")
-                    return jsonify({"status": "ERROR", "message": f"Enrollment failed: {type(e).__name__}: {e}"}), 500
-                finally:
-                    self._release_diarizer()
+        audio_name = (request.values.get("audio_name") or "").strip()
+        windows_raw = request.values.get("windows")
+        uploaded = request.files.get("file")
+        has_file = uploaded is not None and uploaded.filename != ""
 
-                # Use the embedding of the dominant speaker (longest speaking
-                # time). Embedding keys vary by whisperx version: raw labels
-                # ('A') in some, public names ('SPEAKER_00') in others —
-                # try dominant label, then its public speaker, then fallback.
-                if embeddings is None or len(embeddings) == 0:
-                    return jsonify({"status": "ERROR", "message": "No speaker embeddings extracted"}), 500
-                durations = (
-                    df.groupby("label")["end"].max() - df.groupby("label")["start"].min()
-                )
-                dominant_label = durations.idxmax()
-                emb = embeddings.get(dominant_label)
-                if emb is None:
-                    rows = df.loc[df["label"] == dominant_label, "speaker"]
-                    if len(rows):
-                        emb = embeddings.get(rows.iloc[0])
-                if emb is None and len(embeddings) == 1:
-                    emb = next(iter(embeddings.values()))
-                if emb is None:
-                    return jsonify({
-                        "status": "ERROR",
-                        "message": f"Dominant speaker '{dominant_label}' has no embedding (keys: {list(embeddings.keys())})",
-                    }), 500
+        if not audio_name and not has_file:
+            return jsonify(
+                {
+                    "status": "ERROR",
+                    "message": "No source provided (expected 'audio_name' + 'windows' or 'file')",
+                }
+            ), 400
 
-                self._save_voiceprint(name, list(emb))
-                self.logger.info(
-                    f"Voiceprint saved: '{name}' from label {dominant_label} ({len(emb)} dim)"
-                )
+        if audio_name:
+            source_path = self.media_folder / audio_name
+            if not source_path.exists():
                 return jsonify(
-                    {
-                        "status": "OK",
-                        "message": f"Voiceprint enrolled for '{name}' (dominant speaker {dominant_label}, {len(embeddings)} speaker(s) found)",
-                    }
-                )
+                    {"status": "ERROR", "message": f"File {audio_name} not found on host"}
+                ), 404
+            try:
+                raw_windows = json.loads(windows_raw or "")
+            except ValueError as e:
+                return jsonify(
+                    {"status": "ERROR", "message": f"Bad 'windows' JSON: {e}"}
+                ), 400
+            if not isinstance(raw_windows, list) or not raw_windows:
+                return jsonify(
+                    {"status": "ERROR", "message": "No windows provided (expected [[start,end],...])"}
+                ), 400
+            # Для окон всегда одна диаризация в один кластер (контракт §1).
+            max_speakers = 1
+        else:
+            raw_windows = None
+            max_speakers = max(1, _env_int("ENROLL_MAX_SPEAKERS", 2))
+            requested = request.values.get("max_speakers")
+            if requested:
+                with contextlib.suppress(TypeError, ValueError):
+                    max_speakers = max(1, int(float(requested)))
+
+        with self._transcription_lock:
+            tmp_ctx = tempfile.TemporaryDirectory(prefix="enroll_")
+            try:
+                with tmp_ctx as tmp:
+                    if audio_name:
+                        decode_path = source_path
+                    else:
+                        decode_path = Path(tmp) / secure_filename(uploaded.filename or "sample.wav")
+                        uploaded.save(decode_path)
+
+                    try:
+                        audio = self.decode_audio(decode_path)
+                    except Exception as e:
+                        self.logger.exception(f"Enrollment: cannot decode source for '{name}'")
+                        return jsonify(
+                            {"status": "ERROR", "message": f"Cannot decode audio: {type(e).__name__}: {e}"}
+                        ), 500
+
+                    duration = audio.size / SAMPLE_RATE
+                    if audio_name:
+                        windows = voiceprints.normalize_windows(raw_windows, duration)
+                    else:
+                        windows = voiceprints.normalize_windows([[0.0, duration]], duration)
+                    speech_seconds = voiceprints.windows_total_seconds(windows)
+                    if speech_seconds < voiceprints.ENROLL_MIN_TOTAL_SECONDS:
+                        return jsonify(
+                            {
+                                "status": "ERROR",
+                                "message": f"Too little speech: {speech_seconds:.1f}s",
+                            }
+                        ), 400
+
+                    concat, placements = voiceprints.concat_windows(audio, windows)
+                    del audio
+                    self.logger.info(
+                        f"Enrolling '{name}' from {len(windows)} window(s) "
+                        f"({voiceprints.windows_total_seconds(windows):.1f}s of speech, "
+                        f"{concat.size / SAMPLE_RATE:.1f}s concatenated, "
+                        f"max_speakers={max_speakers})"
+                    )
+                    try:
+                        pipeline = self._get_diarize_pipeline()
+                        df, embeddings = pipeline(
+                            concat,
+                            min_speakers=1,
+                            max_speakers=max_speakers,
+                            return_embeddings=True,
+                        )
+                    except Exception as e:
+                        self.logger.exception(f"Enrollment failed for '{name}': {e}")
+                        return jsonify(
+                            {"status": "ERROR", "message": f"Enrollment failed: {type(e).__name__}: {e}"}
+                        ), 500
+                    finally:
+                        # Диаризатор держит ~2.4 ГБ VRAM — возвращаем всегда.
+                        self._release_diarizer()
+                        del concat
+
+                    if not embeddings:
+                        return jsonify(
+                            {"status": "ERROR", "message": "No speaker embeddings extracted"}
+                        ), 500
+                    rows = df.to_dict("records") if hasattr(df, "to_dict") else []
+                    dominant_label, vector = voiceprints.dominant_embedding(rows, embeddings)
+                    if vector is None:
+                        return jsonify(
+                            {
+                                "status": "ERROR",
+                                "message": f"No embedding for dominant speaker "
+                                f"'{dominant_label}' (keys: {list(embeddings.keys())})",
+                            }
+                        ), 500
+
+                    gallery, entry = voiceprints.upsert_speaker(
+                        self._load_gallery(), name, vector, sample_seconds=speech_seconds
+                    )
+                    self._save_gallery(gallery)
+                    self.logger.info(
+                        f"Voiceprint saved: '{name}' id={entry['id']} "
+                        f"(label {dominant_label}, {len(embeddings)} cluster(s), "
+                        f"samples={entry['samples']})"
+                    )
+                    return jsonify(
+                        {
+                            "status": "OK",
+                            "id": entry["id"],
+                            "name": entry["name"],
+                            "samples": entry["samples"],
+                            "sample_seconds": entry["sample_seconds"],
+                        }
+                    )
+            finally:
+                tmp_ctx.cleanup()
+                self._cleanup_gpu()
 
     def root_page(self):
         return Response("OK")
@@ -971,13 +1178,23 @@ class TranscriberApp:
                 {"status": "ERROR", "message": f"Transcription {transcription_file} not found"}
             )
 
+        # `speakers` читаем ДО удаления текста: _speakers.json переживает выдачу
+        # расшифровки, чтобы клиент мог разметить спикеров после первого чтения.
+        speakers = voiceprints.load_speakers_file(self._speakers_path(base_path.stem))
+
         # Result is consumed on first read (keeps the legacy contract).
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(self.media_folder / f"{base_path.stem}{self.chunks_ext}")
         with contextlib.suppress(FileNotFoundError):
             transcription_file.unlink()
 
-        return jsonify({"status": "OK", "transcription_text": transcription_text.strip()})
+        return jsonify(
+            {
+                "status": "OK",
+                "transcription_text": transcription_text.strip(),
+                "speakers": speakers,
+            }
+        )
 
     def transcribe_from_mp3(self):
         audio_name = request.values.get("audio_name")
@@ -1052,7 +1269,14 @@ class TranscriberApp:
             return jsonify(
                 {"status": "BUSY", "message": "Another transcription is in progress, try again later"}
             ), 503
-        return jsonify({"status": "OK", "transcription_text": text})
+        transcription_text, speakers = text
+        return jsonify(
+            {
+                "status": "OK",
+                "transcription_text": transcription_text,
+                "speakers": speakers or [],
+            }
+        )
 
     def run(self):
         self.app.run(debug=bool(self.debug), host="::", port=self.port)
