@@ -764,9 +764,16 @@ class TranscriberApp:
                     seg["speaker"] = speaker_renames[spk]
                 sink(seg)
 
+        # Окна речи строим из СЫРОЙ диаризации: перебивания внутри фразы
+        # существуют только там (см. voiceprints.diarization_turns).
+        diarization_turns = voiceprints.diarization_turns(diarization)
         speakers = (
             voiceprints.build_speakers(
-                speaker_rows, speaker_vectors, speaker_scores, speaker_names
+                speaker_rows,
+                speaker_vectors,
+                speaker_scores,
+                speaker_names,
+                turns=diarization_turns,
             )
             if speaker_rows
             else []

@@ -399,3 +399,69 @@ class EnrollmentVerdictTest(unittest.TestCase):
         ]
         _, vec, _, _ = vp.enrollment_verdict(rows, self.emb)
         self.assertAlmostEqual(1.0, float(np.linalg.norm(vec)), places=5)
+
+
+class DiarizationTurnsTest(unittest.TestCase):
+    """Окна строятся из сырой диаризации, а не из сегментов whisper.
+
+    Реальный кейс: whisper отдаёт ОДНУ фразу на 30 с, внутри которой
+    собеседник вставил «да» на 1.2 с. В сегментах этого не видно (сегменту
+    присвоен один преобладающий спикер), поэтому окно уходило в склейку
+    целиком — вместе с чужим голосом. Диагностический признак на реальной
+    встрече: все окна доминирующего спикера выходили ровно по 30.000 с.
+    """
+
+    def setUp(self):
+        self.segments = [{"speaker": "SPEAKER_03", "start": 89.0, "end": 119.0}]
+        self.turns = [
+            {"speaker": "SPEAKER_03", "start": 89.0, "end": 101.0},
+            {"speaker": "SPEAKER_01", "start": 101.0, "end": 102.2},
+            {"speaker": "SPEAKER_03", "start": 102.2, "end": 119.0},
+        ]
+
+    def test_interjection_invisible_in_whisper_segments(self):
+        # без turns поведение прежнее — одно «грязное» окно
+        out = {s["label"]: s for s in vp.build_speakers(self.segments)}
+        self.assertEqual([[89.0, 119.0]], out["SPEAKER_03"]["windows"])
+
+    def test_turns_split_window_around_interjection(self):
+        out = {s["label"]: s for s in vp.build_speakers(self.segments, turns=self.turns)}
+        self.assertEqual([[89.0, 101.0], [102.2, 119.0]], out["SPEAKER_03"]["windows"])
+
+    def test_totals_still_come_from_whisper_segments(self):
+        # total_sec/segments — то, что видно в тексте, они не меняются
+        out = {s["label"]: s for s in vp.build_speakers(self.segments, turns=self.turns)}
+        self.assertEqual(30.0, out["SPEAKER_03"]["total_sec"])
+        self.assertEqual(1, out["SPEAKER_03"]["segments"])
+
+    def test_turns_parsed_from_dataframe_like_rows(self):
+        rows = [
+            {"start": 1.0, "end": 5.0, "label": "A", "speaker": "SPEAKER_00"},
+            {"start": 5.0, "end": 6.0, "label": "B", "speaker": "SPEAKER_01"},
+            {"start": 6.0, "end": 9.0, "speaker": "SPEAKER_00", "label": "A"},
+        ]
+
+        class _DF:
+            def to_dict(self, _orient):
+                return rows
+
+        turns = vp.diarization_turns(_DF())
+        self.assertEqual(3, len(turns))
+        self.assertEqual("SPEAKER_00", turns[0]["speaker"])
+        self.assertEqual((1.0, 5.0), (turns[0]["start"], turns[0]["end"]))
+
+    def test_turns_prefer_public_speaker_over_raw_label(self):
+        turns = vp.diarization_turns([{"start": 0.0, "end": 2.0, "label": "A", "speaker": "SPEAKER_07"}])
+        self.assertEqual("SPEAKER_07", turns[0]["speaker"])
+
+    def test_turns_tolerate_broken_rows(self):
+        turns = vp.diarization_turns([
+            {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},
+            {"start": 5.0, "end": 5.0, "speaker": "SPEAKER_00"},   # нулевая длина
+            {"start": "x", "end": 9.0, "speaker": "SPEAKER_00"},   # мусор
+            {"start": 10.0, "end": 12.0},                          # без метки
+        ])
+        self.assertEqual(1, len(turns))
+
+    def test_none_diarization_gives_no_turns(self):
+        self.assertEqual([], vp.diarization_turns(None))

@@ -613,17 +613,61 @@ def save_gallery_file(path: Path, gallery: Sequence[Dict[str, Any]]) -> None:
 # speakers: сборка ответа /get_status
 # ------------------------------------------------------------------------- #
 
+def diarization_turns(df: Any) -> List[Dict[str, Any]]:
+    """Сырые интервалы диаризации: `[{"speaker", "start", "end"}, ...]`.
+
+    Окна речи обязаны строиться ИМЕННО отсюда, а не из сегментов whisper.
+    Сегмент whisper — это фраза, которой `assign_word_speakers` присвоил
+    одного преобладающего спикера: вставка собеседника («да», «ага») внутри
+    фразы в сегментах не видна вообще, и вырезать её невозможно. Замерено на
+    реальной встрече: все окна доминирующего спикера выходили ровно по 30.000 с
+    (упор в максимум), то есть между его сегментами «чужих» просто не было —
+    при том, что на слух в семпле говорили двое.
+
+    Диаризация же отдаёт интервалы с разрешением в доли секунды и помечает
+    перебивания отдельными строками. `df` — DataFrame pyannote/whisperx со
+    столбцами `start`/`end` и меткой (`speaker`, иначе `label`).
+    """
+    if df is None:
+        return []
+    rows = df.to_dict("records") if hasattr(df, "to_dict") else list(df)
+    turns: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        speaker = row.get("speaker") or row.get("label")
+        if speaker is None:
+            continue
+        try:
+            start, end = float(row["start"]), float(row["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        turns.append({"speaker": str(speaker), "start": start, "end": end})
+    turns.sort(key=lambda t: (t["start"], t["end"]))
+    return turns
+
+
 def build_speakers(
     segments: Iterable[Dict[str, Any]],
     vectors: Optional[Dict[str, np.ndarray]] = None,
     scores: Optional[Dict[str, float]] = None,
     names: Optional[Dict[str, str]] = None,
+    turns: Optional[Iterable[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Собрать массив `speakers` из строк диаризации (контракт §1.3).
+    """Собрать массив `speakers` (контракт §1.3).
 
-    `segments` — последовательность словарей `{"speaker", "start", "end"}`;
+    `segments` — сегменты whisper `{"speaker", "start", "end"}`: по ним
+    считаются `total_sec` и `segments`, то есть ровно то, что видно в тексте.
     `vectors`/`scores`/`names` — результат `identify_speakers`. `label` — всегда
     исходная метка `SPEAKER_XX`, чтобы клиент нашёл её в тексте.
+
+    `turns` — **сырые интервалы диаризации** (`diarization_turns`). Если они
+    переданы, окна речи строятся по ним, а не по сегментам whisper: вставка
+    собеседника внутри фразы существует только на этом уровне, в сегментах её
+    не видно (сегменту присвоен один преобладающий спикер). Без `turns`
+    окна считаются по сегментам — хуже, но обратно совместимо.
 
     Окна речи (`windows`) каждого спикера считаются с учётом речи **остальных**:
     сквозь чужие реплики окна не склеиваются и чужие интервалы вычитаются.
@@ -641,8 +685,22 @@ def build_speakers(
             continue
         grouped.setdefault(str(speaker), []).append(seg)
 
+    # источник окон: сырые интервалы диаризации, если они есть
+    turn_rows = list(turns or [])
+    windows_source: Dict[str, List[Dict[str, Any]]] = {}
+    if turn_rows:
+        for turn in turn_rows:
+            speaker = turn.get("speaker")
+            if not speaker:
+                continue
+            windows_source.setdefault(str(speaker), []).append(turn)
+    else:
+        windows_source = grouped
+
+    # «Чужая речь» считается по ТОМУ ЖЕ источнику, что и окна: смешивать
+    # интервалы диаризации с сегментами whisper нельзя — границы разъедутся.
     spans_by_speaker: Dict[str, List[Tuple[float, float]]] = {}
-    for speaker, rows in grouped.items():
+    for speaker, rows in windows_source.items():
         spans: List[Tuple[float, float]] = []
         for row in rows:
             try:
@@ -663,6 +721,7 @@ def build_speakers(
             if other != speaker
             for span in spans
         ]
+        window_rows = windows_source.get(speaker, rows)
         result.append(
             {
                 "label": speaker,
@@ -681,7 +740,7 @@ def build_speakers(
                     if vector is not None
                     else None
                 ),
-                "windows": select_windows(rows, blockers=foreign),
+                "windows": select_windows(window_rows, blockers=foreign),
             }
         )
     return result
