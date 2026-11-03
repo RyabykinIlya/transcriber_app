@@ -30,6 +30,7 @@ ENV PYTHONUNBUFFERED=1
 
 # COPY for_load.mp3 .
 COPY app_transcriber.py .
+COPY voiceprints.py .
 
 # RUN python app_transcriber.py load
 

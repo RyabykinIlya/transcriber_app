@@ -10,3 +10,4 @@ app/docker-cache/
 
 # local A/B test audio samples
 .abtest/*.wav
+.build/
