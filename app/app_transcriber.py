@@ -1040,11 +1040,15 @@ class TranscriberApp:
                 return jsonify(
                     {"status": "ERROR", "message": "No windows provided (expected [[start,end],...])"}
                 ), 400
-            # Для окон всегда одна диаризация в один кластер (контракт §1).
-            max_speakers = 1
+            # Кластеров просим больше одного: склейка окон спикера почти
+            # всегда задевает чужие реплики, и при max_speakers=1 pyannote
+            # физически не может их увидеть — подмешанный голос молча
+            # усреднялся в слепок. Теперь лишние кластеры видны, и
+            # `enrollment_verdict` отклоняет грязную склейку (409).
+            max_speakers = max(2, _env_int("ENROLL_MAX_SPEAKERS", 3))
         else:
             raw_windows = None
-            max_speakers = max(1, _env_int("ENROLL_MAX_SPEAKERS", 2))
+            max_speakers = max(2, _env_int("ENROLL_MAX_SPEAKERS", 3))
             requested = request.values.get("max_speakers")
             if requested:
                 with contextlib.suppress(TypeError, ValueError):
@@ -1113,7 +1117,9 @@ class TranscriberApp:
                             {"status": "ERROR", "message": "No speaker embeddings extracted"}
                         ), 500
                     rows = df.to_dict("records") if hasattr(df, "to_dict") else []
-                    dominant_label, vector = voiceprints.dominant_embedding(rows, embeddings)
+                    dominant_label, vector, foreign_ratio, clean = (
+                        voiceprints.enrollment_verdict(rows, embeddings)
+                    )
                     if vector is None:
                         return jsonify(
                             {
@@ -1122,6 +1128,28 @@ class TranscriberApp:
                                 f"'{dominant_label}' (keys: {list(embeddings.keys())})",
                             }
                         ), 500
+                    if not clean:
+                        # Склейка задела чужую речь. Усреднять её с чистым голосом
+                        # нельзя: такой слепок потом не матчится ни с чем, и
+                        # перезачисление выглядит как «стало только хуже».
+                        self.logger.warning(
+                            f"Enrollment rejected for '{name}': {len(embeddings)} cluster(s), "
+                            f"foreign speech {foreign_ratio:.0%} "
+                            f"(limit {voiceprints.ENROLL_MAX_FOREIGN_RATIO:.0%})"
+                        )
+                        return jsonify(
+                            {
+                                "status": "ERROR",
+                                "message": (
+                                    f"В семпле смешано несколько голосов "
+                                    f"({foreign_ratio:.0%} чужой речи). "
+                                    f"Выбери другого спикера или другое окно."
+                                ),
+                                "reason": "mixed_voices",
+                                "foreign_ratio": foreign_ratio,
+                                "clusters": len(embeddings),
+                            }
+                        ), 409
 
                     gallery, entry = voiceprints.upsert_speaker(
                         self._load_gallery(), name, vector, sample_seconds=speech_seconds

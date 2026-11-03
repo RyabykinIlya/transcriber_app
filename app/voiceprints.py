@@ -45,6 +45,13 @@ WINDOW_MAX_SECONDS = 30.0
 WINDOWS_TOTAL_SECONDS = 180.0
 
 GALLERY_VERSION = 2
+#: Максимальная доля чужой речи в склейке при зачислении.
+#: Выше — зачисление отклоняется: слепок получится «средним по комнате».
+ENROLL_MAX_FOREIGN_RATIO = 0.15
+#: Два кластера с косинусом выше этого считаются одним человеком: pyannote
+#: иногда режет один голос на два кластера (тихо/громко, близко/далеко от
+#: микрофона), и без склейки «чужой речью» оказалась бы половина реплик.
+SAME_VOICE_COSINE = 0.80
 
 
 # ------------------------------------------------------------------------- #
@@ -161,8 +168,16 @@ def concat_windows(
 def merge_runs(
     segments: Iterable[Dict[str, Any]],
     gap_seconds: float = RUN_GAP_SECONDS,
+    blockers: Optional[Iterable[Tuple[float, float]]] = None,
 ) -> List[Tuple[float, float]]:
-    """Слить перекрывающиеся и смежные (зазор < `gap_seconds`) сегменты."""
+    """Слить перекрывающиеся и смежные (зазор < `gap_seconds`) сегменты.
+
+    `blockers` — интервалы, где говорит **кто-то другой**. Через такой зазор
+    склеивать нельзя: в записях, где собеседники перебивают друг друга, пауза
+    в 1 секунду часто занята чужой репликой («да», «ага», «в смысле»), и склейка
+    подмешивает чужой голос в слепок. Замерено на реальной встрече: окно
+    842–892 с содержало 2 с речи другого спикера.
+    """
     spans: List[List[float]] = []
     for seg in segments or []:
         try:
@@ -174,14 +189,69 @@ def merge_runs(
         spans.append([start, end])
     spans.sort(key=lambda s: (s[0], s[1]))
 
+    blocked = sorted(
+        (float(a), float(b)) for a, b in (blockers or []) if float(b) > float(a)
+    )
+
+    def _foreign_between(left: float, right: float) -> bool:
+        """Есть ли чужой голос в зазоре (left, right)."""
+        for b_start, b_end in blocked:
+            if b_end <= left:
+                continue
+            if b_start >= right:
+                break
+            return True
+        return False
+
     merged: List[List[float]] = []
     for start, end in spans:
-        if merged and start - merged[-1][1] < gap_seconds:
+        if (
+            merged
+            and start - merged[-1][1] < gap_seconds
+            and not _foreign_between(merged[-1][1], start)
+        ):
             if end > merged[-1][1]:
                 merged[-1][1] = end
         else:
             merged.append([start, end])
     return [(s, e) for s, e in merged]
+
+
+def subtract_blockers(
+    windows: Iterable[Tuple[float, float]],
+    blockers: Iterable[Tuple[float, float]],
+) -> List[Tuple[float, float]]:
+    """Вырезать из окон чужую речь (на случай наложений от assign_word_speakers).
+
+    Диаризация иногда отдаёт перекрывающиеся интервалы: один сегмент помечен
+    сразу двумя голосами. Если такое окно уйдёт в склейку целиком, чужой голос
+    попадёт в слепок — поэтому чужие интервалы физически вычитаются.
+    """
+    spans = [(float(a), float(b)) for a, b in windows or [] if float(b) > float(a)]
+    cuts = sorted((float(a), float(b)) for a, b in blockers or [] if float(b) > float(a))
+    if not cuts:
+        return spans
+
+    result: List[Tuple[float, float]] = []
+    for start, end in spans:
+        pieces = [(start, end)]
+        for cut_start, cut_end in cuts:
+            if cut_end <= start:
+                continue
+            if cut_start >= end:
+                break
+            next_pieces: List[Tuple[float, float]] = []
+            for p_start, p_end in pieces:
+                if cut_end <= p_start or cut_start >= p_end:
+                    next_pieces.append((p_start, p_end))
+                    continue
+                if cut_start > p_start:
+                    next_pieces.append((p_start, cut_start))
+                if cut_end < p_end:
+                    next_pieces.append((cut_end, p_end))
+            pieces = next_pieces
+        result.extend(pieces)
+    return [(a, b) for a, b in result if b > a]
 
 
 def select_windows(
@@ -191,6 +261,7 @@ def select_windows(
     max_seconds: float = WINDOW_MAX_SECONDS,
     total_seconds: float = WINDOWS_TOTAL_SECONDS,
     gap_seconds: float = RUN_GAP_SECONDS,
+    blockers: Optional[Iterable[Tuple[float, float]]] = None,
 ) -> List[List[float]]:
     """До `limit` самых длинных непрерывных окон речи, отсортированных по началу.
 
@@ -199,12 +270,20 @@ def select_windows(
     `total_seconds` (последнее окно при необходимости подрезается, но не
     короче `min_seconds`). Это ровно то, что клиент попросит склеить при
     зачислении голоса.
+
+    `blockers` — интервалы чужой речи. Через них не склеиваем (см. `merge_runs`)
+    и потом дополнительно вычитаем: окно должно содержать только этот голос,
+    иначе в слепок подмешается собеседник.
     """
+    foreign = [
+        (float(a), float(b)) for a, b in (blockers or []) if float(b) > float(a)
+    ]
     candidates: List[Tuple[float, float]] = []
-    for start, end in merge_runs(segments, gap_seconds):
+    for start, end in merge_runs(segments, gap_seconds, foreign):
         end = min(end, start + max_seconds)
-        if end - start >= min_seconds:
-            candidates.append((start, end))
+        for clean_start, clean_end in subtract_blockers([(start, end)], foreign):
+            if clean_end - clean_start >= min_seconds:
+                candidates.append((clean_start, clean_end))
 
     candidates.sort(key=lambda w: (-(w[1] - w[0]), w[0]))
 
@@ -545,6 +624,11 @@ def build_speakers(
     `segments` — последовательность словарей `{"speaker", "start", "end"}`;
     `vectors`/`scores`/`names` — результат `identify_speakers`. `label` — всегда
     исходная метка `SPEAKER_XX`, чтобы клиент нашёл её в тексте.
+
+    Окна речи (`windows`) каждого спикера считаются с учётом речи **остальных**:
+    сквозь чужие реплики окна не склеиваются и чужие интервалы вычитаются.
+    Иначе в запись, где собеседники перебивают друг друга, в склейку попадает
+    второй голос — и зачисленный слепок оказывается «средним по комнате».
     """
     vectors = vectors or {}
     scores = scores or {}
@@ -557,10 +641,28 @@ def build_speakers(
             continue
         grouped.setdefault(str(speaker), []).append(seg)
 
+    spans_by_speaker: Dict[str, List[Tuple[float, float]]] = {}
+    for speaker, rows in grouped.items():
+        spans: List[Tuple[float, float]] = []
+        for row in rows:
+            try:
+                start, end = float(row["start"]), float(row["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end > start:
+                spans.append((start, end))
+        spans_by_speaker[speaker] = spans
+
     result: List[Dict[str, Any]] = []
     for speaker in sorted(grouped):
         rows = grouped[speaker]
         vector = vectors.get(speaker)
+        foreign = [
+            span
+            for other, spans in spans_by_speaker.items()
+            if other != speaker
+            for span in spans
+        ]
         result.append(
             {
                 "label": speaker,
@@ -579,7 +681,7 @@ def build_speakers(
                     if vector is not None
                     else None
                 ),
-                "windows": select_windows(rows),
+                "windows": select_windows(rows, blockers=foreign),
             }
         )
     return result
@@ -607,6 +709,110 @@ def save_speakers_file(path: Path, speakers: Sequence[Dict[str, Any]]) -> None:
         encoding="utf-8",
     )
     tmp.replace(path)
+
+
+def cluster_totals(
+    rows: Iterable[Dict[str, Any]],
+    embeddings: Dict[str, Any],
+) -> List[Tuple[str, float]]:
+    """Кластеры диаризации с суммарной длительностью, по убыванию.
+
+    Ключи `embeddings` — сырые метки (`'A'`), а в строках `df` бывает и
+    публичная `SPEAKER_XX`; возвращаем ту метку, которая есть среди ключей
+    эмбеддингов, чтобы вызывающий сразу мог её использовать.
+    """
+    totals: Dict[str, float] = {}
+    public: Dict[str, str] = {}
+    for row in rows or []:
+        label = str(row.get("label"))
+        try:
+            duration = max(0.0, float(row["end"]) - float(row["start"]))
+        except (KeyError, TypeError, ValueError):
+            duration = 0.0
+        totals[label] = totals.get(label, 0.0) + duration
+        if row.get("speaker"):
+            public.setdefault(label, str(row["speaker"]))
+
+    resolved: Dict[str, float] = {}
+    for label, duration in totals.items():
+        key = label
+        if (embeddings or {}) and label not in embeddings:
+            alternative = public.get(label)
+            if alternative in embeddings:
+                key = alternative
+        if (embeddings or {}) and key not in embeddings:
+            continue
+        resolved[key] = resolved.get(key, 0.0) + duration
+
+    return sorted(resolved.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def enrollment_verdict(
+    rows: Iterable[Dict[str, Any]],
+    embeddings: Dict[str, Any],
+    max_foreign_ratio: float = ENROLL_MAX_FOREIGN_RATIO,
+    same_voice_cosine: float = SAME_VOICE_COSINE,
+) -> Tuple[Optional[str], Optional[np.ndarray], float, bool]:
+    """Можно ли зачислять по этой склейке, и чей это голос.
+
+    Двухступенчатая защита от подмешивания чужого голоса:
+
+    1. **Склейка двойников.** pyannote часто режет один голос на два кластера
+       (тихо/громко, ближе/дальше от микрофона). Кластеры с косинусом ≥
+       `same_voice_cosine` — один человек: их речь и эмбеддинги объединяются
+       (вектор — взвешенное среднее по длительности), иначе «чужой речью»
+       оказалась бы половина собственных реплик.
+    2. **Порог чистоты.** Оставшиеся кластеры — честно чужие. Если их доля
+       больше `max_foreign_ratio`, зачисление отклоняется: усреднять чужой
+       голос с чистым нельзя, такой слепок потом не матчится ни с чем.
+
+    Возвращает `(label, vector, foreign_ratio, ok)`:
+      * `label`/`vector` — доминирующий голос (для логирования и ответа);
+      * `foreign_ratio` — доля чужой речи после склейки двойников;
+      * `ok` — доля чужой речи не больше `max_foreign_ratio`.
+    """
+    totals = cluster_totals(rows, embeddings)
+    if not totals:
+        return None, None, 0.0, False
+
+    # `cluster_totals` возвращает список пар, отсортированный по убыванию —
+    # первый элемент и есть доминирующий голос.
+    dominant_label = totals[0][0]
+    dominant_vec = np.asarray(embeddings.get(dominant_label), dtype=np.float32).reshape(-1)
+    if not dominant_vec.size:
+        return dominant_label, None, 0.0, False
+    dominant_vec = l2_normalize(dominant_vec)
+
+    seconds_by_label = dict(totals)
+
+    # какие кластеры — тот же самый голос (двойники доминирующего)
+    twin_labels = [dominant_label]
+    for label, _ in totals:
+        if label == dominant_label:
+            continue
+        other = np.asarray(embeddings.get(label), dtype=np.float32).reshape(-1)
+        if other.size == dominant_vec.size and cosine_similarity(dominant_vec, other) >= same_voice_cosine:
+            twin_labels.append(label)
+
+    twin_seconds = sum(seconds_by_label.get(label, 0.0) for label in twin_labels)
+    total_seconds = sum(seconds for _, seconds in totals if seconds > 0)
+    foreign = max(0.0, total_seconds - twin_seconds)
+    ratio = (foreign / total_seconds) if total_seconds > 0 else 0.0
+
+    # итоговый вектор — взвешенное по речи среднее двойников (L2 заново)
+    if len(twin_labels) > 1:
+        acc = np.zeros_like(dominant_vec, dtype=np.float32)
+        weight = 0.0
+        for label in twin_labels:
+            vec = np.asarray(embeddings.get(label), dtype=np.float32).reshape(-1)
+            sec = float(seconds_by_label.get(label, 0.0))
+            if vec.size == acc.size:
+                acc += l2_normalize(vec) * sec
+                weight += sec
+        if weight > 0:
+            dominant_vec = l2_normalize(acc)
+
+    return dominant_label, dominant_vec, round(ratio, 4), ratio <= max_foreign_ratio
 
 
 def dominant_embedding(

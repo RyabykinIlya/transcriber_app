@@ -285,3 +285,117 @@ class DominantEmbeddingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForeignSpeechTest(unittest.TestCase):
+    """Чужая речь не должна попадать в окна спикера (реальный кейс).
+
+    Встреча, где собеседники перебивают: реплика «да» (0.6 с) вставлена в
+    паузу между сегментами SPEAKER_00. Раньше merge_runs склеивал 786–813
+    в одно окно, и чужой голос уезжал в склейку для зачисления.
+    """
+
+    def test_interjection_in_gap_is_not_swallowed(self):
+        rows = [
+            {"speaker": "SPEAKER_00", "start": 786.0, "end": 800.0},
+            {"speaker": "SPEAKER_01", "start": 800.0, "end": 800.6},
+            {"speaker": "SPEAKER_00", "start": 800.6, "end": 813.0},
+        ]
+        out = {s["label"]: s for s in vp.build_speakers(rows)}
+        self.assertEqual(
+            [[786.0, 800.0], [800.6, 813.0]], out["SPEAKER_00"]["windows"]
+        )
+
+    def test_overlapping_foreign_segment_is_subtracted(self):
+        rows = [
+            {"speaker": "SPEAKER_00", "start": 100.0, "end": 130.0},
+            {"speaker": "SPEAKER_01", "start": 110.0, "end": 118.0},
+        ]
+        out = {s["label"]: s for s in vp.build_speakers(rows)}
+        self.assertEqual([[100.0, 110.0], [118.0, 130.0]], out["SPEAKER_00"]["windows"])
+
+    def test_pure_gap_still_merges(self):
+        rows = [
+            {"speaker": "SPEAKER_00", "start": 10.0, "end": 20.0},
+            {"speaker": "SPEAKER_00", "start": 20.5, "end": 30.0},
+        ]
+        out = {s["label"]: s for s in vp.build_speakers(rows)}
+        self.assertEqual([[10.0, 30.0]], out["SPEAKER_00"]["windows"])
+
+    def test_short_pieces_after_subtraction_are_dropped(self):
+        # окно 12 с, внутри чужих 10 с -> куски 2 с, минимальное окно 6 с
+        rows = [
+            {"speaker": "SPEAKER_00", "start": 0.0, "end": 12.0},
+            {"speaker": "SPEAKER_01", "start": 2.0, "end": 12.0},
+        ]
+        out = {s["label"]: s for s in vp.build_speakers(rows)}
+        self.assertEqual([], out["SPEAKER_00"]["windows"])
+
+
+def _voice(seed: int) -> np.ndarray:
+    return vp.l2_normalize(
+        np.random.default_rng(seed).normal(size=256).astype(np.float32)
+    )
+
+
+class EnrollmentVerdictTest(unittest.TestCase):
+    """Зачисление: двойники склеиваются, чужой голос — порог."""
+
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        self.me = _voice(1)
+        self.other = _voice(2)
+        self.twin = vp.l2_normalize(
+            self.me + rng.normal(size=256).astype(np.float32) * 0.05
+        )
+        self.emb = {"A": self.me, "B": self.twin, "C": self.other}
+
+    def test_twins_are_one_voice_not_foreign(self):
+        # один голос, порезанный диаризацией на два кластера
+        rows = [
+            {"label": "A", "start": 0, "end": 50},
+            {"label": "B", "start": 50.5, "end": 100},
+        ]
+        label, vec, ratio, ok = vp.enrollment_verdict(rows, self.emb)
+        self.assertEqual("A", label)
+        self.assertAlmostEqual(0.0, ratio)
+        self.assertTrue(ok)
+
+    def test_foreign_25_percent_rejected(self):
+        rows = [
+            {"label": "A", "start": 0, "end": 40},
+            {"label": "B", "start": 40, "end": 40.3},
+            {"label": "B", "start": 40.3, "end": 60},
+            {"label": "C", "start": 60, "end": 80},
+        ]
+        _, _, ratio, ok = vp.enrollment_verdict(rows, self.emb)
+        self.assertAlmostEqual(0.25, ratio, places=2)
+        self.assertFalse(ok)
+
+    def test_foreign_10_percent_allowed(self):
+        rows = [
+            {"label": "A", "start": 0, "end": 45},
+            {"label": "B", "start": 45, "end": 45.3},
+            {"label": "B", "start": 45.3, "end": 90},
+            {"label": "C", "start": 90, "end": 100},
+        ]
+        _, _, ratio, ok = vp.enrollment_verdict(rows, self.emb)
+        self.assertAlmostEqual(0.10, ratio, places=2)
+        self.assertTrue(ok)
+
+    def test_half_and_half_rejected(self):
+        rows = [
+            {"label": "A", "start": 0, "end": 50},
+            {"label": "C", "start": 50, "end": 100},
+        ]
+        _, _, ratio, ok = vp.enrollment_verdict(rows, self.emb)
+        self.assertAlmostEqual(0.5, ratio, places=2)
+        self.assertFalse(ok)
+
+    def test_result_vector_is_l2_normalized(self):
+        rows = [
+            {"label": "A", "start": 0, "end": 40},
+            {"label": "B", "start": 40.3, "end": 60},
+        ]
+        _, vec, _, _ = vp.enrollment_verdict(rows, self.emb)
+        self.assertAlmostEqual(1.0, float(np.linalg.norm(vec)), places=5)
